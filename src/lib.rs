@@ -1,4 +1,3 @@
-// src/lib.rs
 pub mod certification;
 pub mod consensus;
 pub mod dag;
@@ -35,7 +34,6 @@ pub use drain::*;
 pub use engine::*;
 pub use error::*;
 pub use event::{OperationType, VectorEvent, VectorState};
-pub use state::StateRoot;
 pub use ffi::*;
 pub use hash::*;
 pub use interpreter::*;
@@ -45,16 +43,20 @@ pub use python_api::*;
 pub use query::*;
 pub use reconstruction::*;
 pub use record::*;
-pub use replay::*;
 pub use sdk::*;
 pub use serialization::*;
 pub use signature::*;
 pub use snapshot::*;
+pub use state::StateRoot;
 pub use state::*;
 pub use storage::*;
 pub use transfer::*;
 pub use validation::*;
-pub use wallet::*;
+
+// Keep these modules public, but do not glob-reexport them here because they
+// create ambiguous root-level names with `state::*` and `signature::*`.
+pub use replay::compute_state_root as replay_compute_state_root;
+pub use wallet::verifying_key_from_hex as wallet_verifying_key_from_hex;
 
 use pyo3::prelude::*;
 use pyo3::types::PyModule;

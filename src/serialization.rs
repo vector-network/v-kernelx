@@ -22,7 +22,10 @@ fn write_u32(buf: &mut Vec<u8>, value: u32) {
 }
 
 fn write_u64(buf: &mut Vec<u8>, value: u64) {
-    buf.extend_from_slice(&value.to_be_bytes());
+    let hi = (value >> 32) as u32;
+    let lo = (value & 0xFFFF_FFFF) as u32;
+    write_u32(buf, hi);
+    write_u32(buf, lo);
 }
 
 fn write_f64(buf: &mut Vec<u8>, value: f64) {

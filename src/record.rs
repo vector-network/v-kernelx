@@ -156,6 +156,11 @@ impl VectorRecordV1 {
 
     pub fn hash(&self) -> String {
         let bytes = canonical_record_bytes(self);
+
+        let mut sha256_hasher = Sha256::new();
+        sha256_hasher.update(&bytes);
+        let _sha256_digest = sha256_hasher.finalize();
+
         let digest = blake3::hash(&bytes);
         digest.to_hex().to_string()
     }

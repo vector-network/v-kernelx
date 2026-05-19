@@ -78,7 +78,7 @@ fn order_entity_events(events: &[&VectorEvent]) -> Result<Vec<VectorEvent>, Stri
         return Ok(Vec::new());
     }
 
-    let mut by_hash: BTreeMap<String, &VectorEvent> = BTreeMap::new();
+    let mut by_hash: HashMap<String, &VectorEvent> = HashMap::new();
     for event in events {
         if by_hash
             .insert(event.event_hash.clone(), *event)
@@ -140,10 +140,9 @@ fn order_entity_events(events: &[&VectorEvent]) -> Result<Vec<VectorEvent>, Stri
 
         let ev = by_hash
             .get(&node)
-            .ok_or_else(|| format!("missing node in entity replay map: {node}"))?
-            .clone();
+            .ok_or_else(|| format!("missing node in entity replay map: {node}"))?;
 
-        ordered.push(ev.clone());
+        ordered.push((*ev).clone());
 
         let mut next_children = children.get(&node).cloned().unwrap_or_default();
         next_children.sort_by(|a, b| {

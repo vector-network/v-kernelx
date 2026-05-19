@@ -1,4 +1,3 @@
-// src/ffi.rs
 use crate::dag::{topological_order, validate_dag};
 use crate::hash::{canonical_event_hash, canonical_payload_hash};
 use crate::replay::{compute_state_root, replay_events};
@@ -107,7 +106,12 @@ pub extern "C" fn kernel_execute_operation(input_json: *const c_char) -> *mut c_
         Err(e) => return err_json(format!("batch parse error: {e}")),
     };
 
-    match replay_events(&events) {
+    let ordered = match topological_order(&events) {
+        Ok(v) => v,
+        Err(e) => return err_json(format!("batch ordering error: {e}")),
+    };
+
+    match replay_events(&ordered) {
         Ok(result) => ok_json(json!({
             "state_root": result.state_root,
             "replay_hash": result.replay_hash,
@@ -166,6 +170,7 @@ pub extern "C" fn kernel_compute_state_root(input_json: *const c_char) -> *mut c
             Err(e) => return err_json(format!("final_state parse error: {e}")),
         };
 
+    let _canonical_state_bytes = final_state.canonical_bytes();
     let state_root = compute_state_root(&final_state, event_count, logical_clock);
     ok_json(json!(state_root))
 }

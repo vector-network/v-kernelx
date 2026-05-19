@@ -52,6 +52,13 @@ impl<S: KernelStore> KernelEngine<S> {
         }
     }
 
+    fn assert_record_operation_kind(record: &VectorRecordV1, expected: OperationType) {
+        debug_assert_eq!(
+            Self::op_kind_to_event_kind(&record.operation).canonical_name(),
+            expected.canonical_name()
+        );
+    }
+
     fn vector_v1_to_event_state(state: &VectorStateV1) -> Result<VectorState, KernelXError> {
         let mut components = Vec::with_capacity(state.components.len());
         for component in &state.components {
@@ -77,7 +84,7 @@ impl<S: KernelStore> KernelEngine<S> {
     }
 
     fn latest_parent_hash_for_entity(&self, entity_id: &str) -> Result<Vec<String>, KernelXError> {
-        let mut events = self.store.load_events_for_replay()?;
+        let mut events = <S as ReplayStore>::load_events_for_replay(&self.store)?;
         events.sort_by(|a, b| {
             a.logical_clock
                 .cmp(&b.logical_clock)
@@ -100,7 +107,7 @@ impl<S: KernelStore> KernelEngine<S> {
         entity_id: &str,
         region_id: &str,
     ) -> Result<u64, KernelXError> {
-        let events = self.store.load_events_for_replay()?;
+        let events = <S as ReplayStore>::load_events_for_replay(&self.store)?;
         let count = events
             .iter()
             .filter(|event| event.entity_id == entity_id && event.region_id == region_id)
@@ -167,7 +174,7 @@ impl<S: KernelStore> KernelEngine<S> {
 
     fn ensure_parent_closure(&self, event: &VectorEvent) -> Result<(), KernelXError> {
         for parent_hash in &event.parent_hashes {
-            if self.store.get_event_by_hash(parent_hash)?.is_none() {
+            if <S as EventStore>::get_event_by_hash(&self.store, parent_hash)?.is_none() {
                 return Err(KernelXError::InvalidState(format!(
                     "orphan event {} references missing parent {}",
                     event.event_hash, parent_hash
@@ -180,17 +187,17 @@ impl<S: KernelStore> KernelEngine<S> {
     fn append_canonical_event(&mut self, event: VectorEvent) -> Result<(), KernelXError> {
         validate_event(&event)?;
         self.ensure_parent_closure(&event)?;
-        self.store.append_event(event)?;
+        <S as EventStore>::append_event(&mut self.store, event)?;
         Ok(())
     }
 
     pub fn replay_canonical_history(&self) -> Result<ReplayResult, KernelXError> {
-        let events = self.store.load_events_for_replay()?;
+        let events = <S as ReplayStore>::load_events_for_replay(&self.store)?;
         replay_events(&events).map_err(KernelXError::InvalidState)
     }
 
     pub fn current_state_root(&self) -> Result<StateRoot, KernelXError> {
-        let states = self.store.list_states()?;
+        let states = <S as StateStore>::list_states(&self.store)?;
         let logical_clock = states.iter().map(|s| s.updated_at_ms).max().unwrap_or(0);
         Ok(compute_state_root(&states, logical_clock))
     }
@@ -205,6 +212,7 @@ impl<S: KernelStore> KernelEngine<S> {
         updated.updated_at_ms = now_ms();
         updated.version += 1;
         self.store.put_state(updated.clone())?;
+
         let record = VectorRecordV1::new(
             make_record_id(
                 "certify",
@@ -217,6 +225,8 @@ impl<S: KernelStore> KernelEngine<S> {
             OperationKind::Certify,
             serde_json::json!({}),
         );
+        Self::assert_record_operation_kind(&record, OperationType::Certify);
+
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
         }
@@ -256,6 +266,7 @@ impl<S: KernelStore> KernelEngine<S> {
         validate_state(&state)?;
         state.certification = certify_state(&state, true, true);
         self.store.put_state(state.clone())?;
+
         let record = VectorRecordV1::new(
             make_record_id(
                 "origin",
@@ -268,6 +279,8 @@ impl<S: KernelStore> KernelEngine<S> {
             OperationKind::OriginCreate,
             serde_json::json!({ "difficulty": difficulty }),
         );
+        Self::assert_record_operation_kind(&record, OperationType::OriginCreate);
+
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
         }
@@ -306,6 +319,7 @@ impl<S: KernelStore> KernelEngine<S> {
         after_to.certification = certify_state(&after_to, true, true);
         self.store.put_state(after_from.clone())?;
         self.store.put_state(after_to.clone())?;
+
         let (mut sender_record, mut receiver_record) = transfer_record(
             &before_from,
             &before_to,
@@ -315,6 +329,10 @@ impl<S: KernelStore> KernelEngine<S> {
         );
         sender_record.certification = after_from.certification.clone();
         receiver_record.certification = after_to.certification.clone();
+
+        Self::assert_record_operation_kind(&sender_record, OperationType::Transfer);
+        Self::assert_record_operation_kind(&receiver_record, OperationType::Transfer);
+
         if accept_record(&sender_record, &self.consensus) {
             self.store.put_record(sender_record)?;
         }
@@ -383,6 +401,7 @@ impl<S: KernelStore> KernelEngine<S> {
             OperationKind::Drain,
             record_params,
         );
+        Self::assert_record_operation_kind(&record, OperationType::Drain);
 
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
@@ -415,6 +434,7 @@ impl<S: KernelStore> KernelEngine<S> {
         let mut after = project_vector(state, projected_components.clone(), escrow_id)?;
         after.certification = certify_state(&after, true, true);
         self.store.put_state(after.clone())?;
+
         let record = VectorRecordV1::new(
             make_record_id(
                 "project",
@@ -428,6 +448,8 @@ impl<S: KernelStore> KernelEngine<S> {
             OperationKind::Project,
             serde_json::json!({ "projected_components": projected_components }),
         );
+        Self::assert_record_operation_kind(&record, OperationType::Project);
+
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
         }
@@ -461,7 +483,13 @@ impl<S: KernelStore> KernelEngine<S> {
         let mut after = reconstruct_vector(state, outcome)?;
         after.certification = certify_state(&after, true, true);
         self.store.put_state(after.clone())?;
-        let record_params = serde_json::json!({ "outcome_tag": outcome_tag, "gains": gains, "losses": losses });
+
+        let record_params = serde_json::json!({
+            "outcome_tag": outcome_tag,
+            "gains": gains,
+            "losses": losses
+        });
+
         let record = VectorRecordV1::new(
             make_record_id("reconstruct", vector_id, record_params.to_string()),
             vector_id.to_string(),
@@ -470,6 +498,8 @@ impl<S: KernelStore> KernelEngine<S> {
             OperationKind::Reconstruct,
             record_params,
         );
+        Self::assert_record_operation_kind(&record, OperationType::Reconstruct);
+
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
         }
