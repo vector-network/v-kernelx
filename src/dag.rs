@@ -1,4 +1,4 @@
-use crate::event::VectorEvent;
+use crate::VectorEvent;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9,19 +9,32 @@ pub struct DagConflict {
 
 fn event_index(events: &[VectorEvent]) -> Result<BTreeMap<String, usize>, String> {
     let mut index = BTreeMap::new();
+
     for (i, event) in events.iter().enumerate() {
         if event.event_hash.is_empty() {
             return Err(format!("event {} has empty event_hash", event.event_id));
         }
+
         if index.insert(event.event_hash.clone(), i).is_some() {
             return Err(format!("duplicate event_hash detected: {}", event.event_hash));
         }
     }
+
     Ok(index)
+}
+
+fn sort_key(event: &VectorEvent) -> (u64, u64, String, String) {
+    (
+        event.logical_clock,
+        event.timestamp,
+        event.event_hash.clone(),
+        event.event_id.clone(),
+    )
 }
 
 pub fn detect_conflicts(events: &[VectorEvent]) -> Vec<DagConflict> {
     let mut conflicts = Vec::new();
+
     let index = match event_index(events) {
         Ok(v) => v,
         Err(err) => {
@@ -50,6 +63,7 @@ pub fn detect_conflicts(events: &[VectorEvent]) -> Vec<DagConflict> {
                     reason: format!("duplicate parent hash in event: {parent}"),
                 });
             }
+
             if !index.contains_key(parent) {
                 conflicts.push(DagConflict {
                     event_hash: event.event_hash.clone(),
@@ -84,12 +98,21 @@ pub fn validate_dag(events: &[VectorEvent]) -> Result<(), String> {
     }
 
     for event in events {
+        let mut seen_parents = BTreeSet::new();
+
         for parent_hash in &event.parent_hashes {
-            let _ = index
+            if !seen_parents.insert(parent_hash.clone()) {
+                return Err(format!(
+                    "duplicate parent hash in event: {}",
+                    event.event_hash
+                ));
+            }
+
+            let parent_index = *index
                 .get(parent_hash)
                 .ok_or_else(|| format!("missing parent event: {parent_hash}"))?;
 
-            let parent = &events[*index.get(parent_hash).unwrap()];
+            let parent = &events[parent_index];
             validate_region_admissibility(parent, event)?;
 
             graph
@@ -111,9 +134,15 @@ pub fn validate_dag(events: &[VectorEvent]) -> Result<(), String> {
     let mut visited = 0_usize;
     while let Some(node) = queue.pop_front() {
         visited += 1;
+
         if let Some(children) = graph.get(&node) {
             let mut sorted_children = children.clone();
-            sorted_children.sort();
+            sorted_children.sort_by(|a, b| {
+                let ia = index.get(a).copied().unwrap();
+                let ib = index.get(b).copied().unwrap();
+                sort_key(&events[ia]).cmp(&sort_key(&events[ib]))
+            });
+
             for child in sorted_children {
                 if let Some(entry) = indegree.get_mut(&child) {
                     *entry -= 1;
@@ -148,7 +177,10 @@ pub fn topological_order(events: &[VectorEvent]) -> Result<Vec<VectorEvent>, Str
     for event in events {
         for parent in &event.parent_hashes {
             *indegree.entry(event.event_hash.clone()).or_insert(0) += 1;
-            children.entry(parent.clone()).or_default().push(event.event_hash.clone());
+            children
+                .entry(parent.clone())
+                .or_default()
+                .push(event.event_hash.clone());
         }
     }
 
@@ -159,33 +191,22 @@ pub fn topological_order(events: &[VectorEvent]) -> Result<Vec<VectorEvent>, Str
         }
     }
 
-    ready.sort_by(|a, b| {
-        let ea = event_map.get(a).unwrap();
-        let eb = event_map.get(b).unwrap();
-        ea.logical_clock
-            .cmp(&eb.logical_clock)
-            .then_with(|| ea.timestamp.cmp(&eb.timestamp))
-            .then_with(|| ea.event_hash.cmp(&eb.event_hash))
-    });
+    ready.sort_by(|a, b| sort_key(event_map.get(a).unwrap()).cmp(&sort_key(event_map.get(b).unwrap())));
 
     let mut ordered = Vec::with_capacity(events.len());
+
     while !ready.is_empty() {
         let node = ready.remove(0);
+
         let ev = event_map
             .get(&node)
             .ok_or_else(|| format!("missing node in event map: {node}"))?
             .clone();
-        ordered.push(ev.clone());
+
+        ordered.push(ev);
 
         let mut next_children = children.get(&node).cloned().unwrap_or_default();
-        next_children.sort_by(|a, b| {
-            let ea = event_map.get(a).unwrap();
-            let eb = event_map.get(b).unwrap();
-            ea.logical_clock
-                .cmp(&eb.logical_clock)
-                .then_with(|| ea.timestamp.cmp(&eb.timestamp))
-                .then_with(|| ea.event_hash.cmp(&eb.event_hash))
-        });
+        next_children.sort_by(|a, b| sort_key(event_map.get(a).unwrap()).cmp(&sort_key(event_map.get(b).unwrap())));
 
         for child in next_children {
             if let Some(entry) = indegree.get_mut(&child) {
@@ -196,14 +217,7 @@ pub fn topological_order(events: &[VectorEvent]) -> Result<Vec<VectorEvent>, Str
             }
         }
 
-        ready.sort_by(|a, b| {
-            let ea = event_map.get(a).unwrap();
-            let eb = event_map.get(b).unwrap();
-            ea.logical_clock
-                .cmp(&eb.logical_clock)
-                .then_with(|| ea.timestamp.cmp(&eb.timestamp))
-                .then_with(|| ea.event_hash.cmp(&eb.event_hash))
-        });
+        ready.sort_by(|a, b| sort_key(event_map.get(a).unwrap()).cmp(&sort_key(event_map.get(b).unwrap())));
     }
 
     if ordered.len() != events.len() {

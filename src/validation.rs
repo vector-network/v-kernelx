@@ -1,9 +1,10 @@
+// src/validation.rs
 use crate::error::KernelXError;
-use crate::event::VectorEvent;
 use crate::hash::{canonical_event_hash, canonical_payload_hash};
 use crate::serialization::canonical_event_payload_bytes;
 use crate::signature::{verifying_key_from_hex, verify_event_signature};
 use crate::state::{validate_canonical_state, VectorStateV1};
+use crate::VectorEvent;
 
 pub fn validate_state(state: &VectorStateV1) -> Result<(), KernelXError> {
     validate_canonical_state(state)?;
@@ -60,7 +61,9 @@ pub fn validate_event(event: &VectorEvent) -> Result<(), KernelXError> {
         let signature_ok = verify_event_signature(&verifying_key, &payload_bytes, &event.signature)
             .map_err(KernelXError::InvalidState)?;
         if !signature_ok {
-            return Err(KernelXError::InvalidState("event signature verification failed".to_string()));
+            return Err(KernelXError::InvalidState(
+                "event signature verification failed".to_string(),
+            ));
         }
     }
 
@@ -80,6 +83,8 @@ pub fn validate_event_signature(
     if ok {
         Ok(())
     } else {
-        Err(KernelXError::InvalidState("event signature verification failed".to_string()))
+        Err(KernelXError::InvalidState(
+            "event signature verification failed".to_string(),
+        ))
     }
 }

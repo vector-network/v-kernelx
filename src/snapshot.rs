@@ -1,7 +1,8 @@
-use crate::event::{StateRoot, VectorState};
+// src/snapshot.rs
 use crate::hash::{canonical_state_root_hash, canonical_tagged_hash};
-use crate::replay::ReplayResult;
 use crate::serialization::CanonicalSerialize;
+use crate::replay::ReplayResult;
+use crate::{StateRoot, VectorState};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 

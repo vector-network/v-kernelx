@@ -1,9 +1,10 @@
+// src/ffi.rs
 use crate::dag::{topological_order, validate_dag};
-use crate::event::VectorEvent;
 use crate::hash::{canonical_event_hash, canonical_payload_hash};
 use crate::replay::{compute_state_root, replay_events};
-use crate::signature::{verifying_key_from_hex, verify_event_signature};
 use crate::serialization::CanonicalSerialize;
+use crate::signature::{verifying_key_from_hex, verify_event_signature};
+use crate::{VectorEvent, VectorState};
 use serde_json::json;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -45,7 +46,11 @@ fn validate_event_internal(event: &VectorEvent) -> Result<serde_json::Value, Str
 
     if !event.actor_public_key.is_empty() && !event.signature.is_empty() {
         match verifying_key_from_hex(&event.actor_public_key) {
-            Ok(vk) => match verify_event_signature(&vk, &crate::serialization::canonical_event_payload_bytes(event), &event.signature) {
+            Ok(vk) => match verify_event_signature(
+                &vk,
+                &crate::serialization::canonical_event_payload_bytes(event),
+                &event.signature,
+            ) {
                 Ok(ok) => signature_ok = ok,
                 Err(e) => signature_error = Some(e),
             },
@@ -155,7 +160,7 @@ pub extern "C" fn kernel_compute_state_root(input_json: *const c_char) -> *mut c
         None => return err_json("missing or invalid logical_clock".to_string()),
     };
 
-    let final_state: std::collections::BTreeMap<String, crate::event::VectorState> =
+    let final_state: std::collections::BTreeMap<String, VectorState> =
         match serde_json::from_value(final_state_value) {
             Ok(v) => v,
             Err(e) => return err_json(format!("final_state parse error: {e}")),

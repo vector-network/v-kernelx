@@ -1,6 +1,7 @@
 use v_kernelx::{
-    find_valid_nonce, verify_origin, KernelEngine, MemoryStore, OperationType, ReplayResult,
-    SettlementOutcome, SimulationHarness, VectorEvent, VectorState, Validation, validate_dag,
+    canonical_event_hash, canonical_payload_hash, find_valid_nonce, validate_dag, verify_origin,
+    KernelEngine, MemoryStore, OperationType, SettlementOutcome, SimulationHarness, VectorEvent,
+    VectorState,
 };
 
 #[test]
@@ -55,6 +56,7 @@ fn replay_is_deterministic_for_same_history() {
             1,
         )
         .expect("origin a");
+
     let _b = engine
         .origin_create(
             "v-b",
@@ -124,8 +126,8 @@ fn dag_validation_rejects_missing_parent() {
         1,
     );
 
-    event.payload_hash = v_kernelx::canonical_payload_hash(&event);
-    event.event_hash = v_kernelx::canonical_event_hash(&event);
+    event.payload_hash = canonical_payload_hash(&event);
+    event.event_hash = canonical_event_hash(&event);
 
     let result = validate_dag(&[event]);
     assert!(result.is_err());

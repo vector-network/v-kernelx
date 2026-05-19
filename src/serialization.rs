@@ -1,4 +1,4 @@
-use crate::event::{OperationType, StateRoot, VectorEvent, VectorState};
+use crate::{OperationType, StateRoot, VectorEvent, VectorState};
 use std::collections::BTreeMap;
 
 /// Deterministic binary serialization helpers.
@@ -105,6 +105,18 @@ impl CanonicalSerialize for StateRoot {
         write_str(&mut buf, &self.root_hash);
         write_u64(&mut buf, self.event_count);
         write_u64(&mut buf, self.logical_clock);
+        buf
+    }
+}
+
+impl<V: CanonicalSerialize> CanonicalSerialize for BTreeMap<String, V> {
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        write_u64(&mut buf, self.len() as u64);
+        for (key, value) in self {
+            write_str(&mut buf, key);
+            buf.extend_from_slice(&value.canonical_bytes());
+        }
         buf
     }
 }

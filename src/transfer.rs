@@ -42,14 +42,14 @@ pub fn transfer_components(
 }
 
 pub fn transfer_record(
-    before_from: VectorStateV1,
-    before_to: VectorStateV1,
-    after_from: VectorStateV1,
-    after_to: VectorStateV1,
+    before_from: &VectorStateV1,
+    before_to: &VectorStateV1,
+    after_from: &VectorStateV1,
+    after_to: &VectorStateV1,
     amount: Vec<u128>,
 ) -> (VectorRecordV1, VectorRecordV1) {
-    let sender_cert = certify_state(&after_from, true, true);
-    let receiver_cert = certify_state(&after_to, true, true);
+    let sender_cert = certify_state(after_from, true, true);
+    let receiver_cert = certify_state(after_to, true, true);
 
     let sender_params = json!({
         "direction": "out",
@@ -65,16 +65,16 @@ pub fn transfer_record(
     let sender = VectorRecordV1::new(
         make_record_id("transfer-out", &after_from.vector_id, sender_params.to_string()),
         after_from.vector_id.clone(),
-        Some(before_from),
-        after_from,
+        Some(before_from.clone()),
+        after_from.clone(),
         OperationKind::Transfer,
         sender_params,
     );
     let receiver = VectorRecordV1::new(
         make_record_id("transfer-in", &after_to.vector_id, receiver_params.to_string()),
         after_to.vector_id.clone(),
-        Some(before_to),
-        after_to,
+        Some(before_to.clone()),
+        after_to.clone(),
         OperationKind::Transfer,
         receiver_params,
     );

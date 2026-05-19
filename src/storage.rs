@@ -1,8 +1,8 @@
 use crate::error::KernelXError;
-use crate::event::VectorEvent;
 use crate::record::VectorRecordV1;
 use crate::snapshot::Snapshot;
 use crate::state::VectorStateV1;
+use crate::VectorEvent;
 use std::collections::BTreeMap;
 
 pub trait StateStore {
@@ -39,6 +39,8 @@ impl<T> KernelStore for T where T: StateStore + EventStore + SnapshotStore + Rep
 pub struct MemoryStore {
     states: BTreeMap<String, VectorStateV1>,
     records: BTreeMap<String, VectorRecordV1>,
+    /// Canonical immutable event store keyed by event_hash.
+    /// This prevents accidental overwrite of a different event with the same event_id.
     events: BTreeMap<String, VectorEvent>,
     snapshots: BTreeMap<String, Snapshot>,
 }
@@ -73,20 +75,50 @@ impl StateStore for MemoryStore {
 
 impl EventStore for MemoryStore {
     fn append_event(&mut self, event: VectorEvent) -> Result<(), KernelXError> {
-        self.events.insert(event.event_id.clone(), event);
+        if event.event_id.is_empty() {
+            return Err(KernelXError::InvalidState(
+                "attempted to append event with empty event_id".to_string(),
+            ));
+        }
+
+        if event.event_hash.is_empty() {
+            return Err(KernelXError::InvalidState(
+                "attempted to append event with empty event_hash".to_string(),
+            ));
+        }
+
+        // Same hash means the exact same canonical event already exists.
+        // Keep the original and reject the duplicate append attempt.
+        if self.events.contains_key(&event.event_hash) {
+            return Err(KernelXError::InvalidState(format!(
+                "duplicate canonical event_hash detected: {}",
+                event.event_hash
+            )));
+        }
+
+        // Same event_id with a different hash is a security violation:
+        // someone is trying to inject a conflicting event identity.
+        if self.events.values().any(|existing| existing.event_id == event.event_id) {
+            return Err(KernelXError::InvalidState(format!(
+                "duplicate event_id detected: {}",
+                event.event_id
+            )));
+        }
+
+        self.events.insert(event.event_hash.clone(), event);
         Ok(())
     }
 
     fn get_event(&self, event_id: &str) -> Result<Option<VectorEvent>, KernelXError> {
-        Ok(self.events.get(event_id).cloned())
-    }
-
-    fn get_event_by_hash(&self, event_hash: &str) -> Result<Option<VectorEvent>, KernelXError> {
         Ok(self
             .events
             .values()
-            .find(|event| event.event_hash == event_hash)
+            .find(|event| event.event_id == event_id)
             .cloned())
+    }
+
+    fn get_event_by_hash(&self, event_hash: &str) -> Result<Option<VectorEvent>, KernelXError> {
+        Ok(self.events.get(event_hash).cloned())
     }
 
     fn list_events(&self) -> Result<Vec<VectorEvent>, KernelXError> {
@@ -109,20 +141,27 @@ impl SnapshotStore for MemoryStore {
     }
 }
 
+fn canonical_event_sort_key(event: &VectorEvent) -> (u64, u64, String, String) {
+    (
+        event.logical_clock,
+        event.timestamp,
+        event.event_hash.clone(),
+        event.event_id.clone(),
+    )
+}
+
 impl ReplayStore for MemoryStore {
     fn load_events_for_replay(&self) -> Result<Vec<VectorEvent>, KernelXError> {
         let mut events: Vec<VectorEvent> = self.events.values().cloned().collect();
-        events.sort_by(|a, b| {
-            a.logical_clock
-                .cmp(&b.logical_clock)
-                .then_with(|| a.timestamp.cmp(&b.timestamp))
-                .then_with(|| a.event_hash.cmp(&b.event_hash))
-                .then_with(|| a.event_id.cmp(&b.event_id))
-        });
+        events.sort_by(|a, b| canonical_event_sort_key(a).cmp(&canonical_event_sort_key(b)));
         Ok(events)
     }
 
     fn load_latest_snapshot(&self) -> Result<Option<Snapshot>, KernelXError> {
-        Ok(self.snapshots.values().cloned().last())
+        Ok(self
+            .snapshots
+            .values()
+            .cloned()
+            .max_by(|a, b| a.snapshot_id.cmp(&b.snapshot_id)))
     }
 }

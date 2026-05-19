@@ -1,3 +1,4 @@
+// src/lib.rs
 pub mod certification;
 pub mod consensus;
 pub mod dag;
@@ -33,7 +34,8 @@ pub use developer::*;
 pub use drain::*;
 pub use engine::*;
 pub use error::*;
-pub use event::{ExecutionResult, OperationType, VectorEvent, VectorState};
+pub use event::{OperationType, VectorEvent, VectorState};
+pub use state::StateRoot;
 pub use ffi::*;
 pub use hash::*;
 pub use interpreter::*;
@@ -106,6 +108,5 @@ fn v_kernelx(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(kernel_version, m)?)?;
     m.add_function(wrap_pyfunction!(exposed_modules, m)?)?;
     m.add_class::<PyKernelEngine>()?;
-
     Ok(())
 }

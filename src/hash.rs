@@ -1,7 +1,8 @@
-use crate::event::{StateRoot, VectorEvent};
+// src/hash.rs
 use crate::serialization::{
     canonical_blob_bytes, canonical_event_bytes, canonical_event_payload_bytes, CanonicalSerialize,
 };
+use crate::{StateRoot, VectorEvent};
 
 fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()

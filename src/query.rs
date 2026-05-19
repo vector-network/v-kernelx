@@ -1,9 +1,10 @@
+// src/query.rs
 use crate::error::KernelXError;
-use crate::event::VectorEvent;
 use crate::record::VectorRecordV1;
 use crate::snapshot::Snapshot;
 use crate::state::VectorStateV1;
 use crate::storage::{EventStore, ReplayStore, SnapshotStore, StateStore};
+use crate::VectorEvent;
 
 pub fn get_vector<S: StateStore>(store: &S, vector_id: &str) -> Result<Option<VectorStateV1>, KernelXError> {
     store.get_state(vector_id)

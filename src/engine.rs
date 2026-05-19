@@ -8,10 +8,9 @@ use crate::origin::create_origin_vector;
 use crate::projection::project_vector;
 use crate::query::{get_event_by_hash, get_vector, list_records, list_vectors};
 use crate::record::{make_record_id, OperationKind, VectorRecordV1};
-use crate::reconstruction::SettlementOutcome;
 use crate::reconstruction::reconstruct_vector;
+use crate::reconstruction::SettlementOutcome;
 use crate::replay::{replay_events, ReplayResult};
-use crate::serialization::canonical_event_payload_bytes;
 use crate::state::{compute_state_root, now_ms, StateRoot, VectorStateV1};
 use crate::storage::{EventStore, KernelStore, MemoryStore, ReplayStore, StateStore};
 use crate::transfer::{transfer_components, transfer_record};
@@ -48,7 +47,8 @@ impl<S: KernelStore> KernelEngine<S> {
             OperationKind::Drain => OperationType::Drain,
             OperationKind::Project => OperationType::Project,
             OperationKind::Reconstruct => OperationType::Reconstruct,
-            OperationKind::Other(name) => OperationType::Other(name.clone()),
+            OperationKind::Query => OperationType::Query,
+            OperationKind::Custom(name) => OperationType::Other(name.clone()),
         }
     }
 
@@ -56,7 +56,9 @@ impl<S: KernelStore> KernelEngine<S> {
         let mut components = Vec::with_capacity(state.components.len());
         for component in &state.components {
             let value = u64::try_from(*component).map_err(|_| {
-                KernelXError::InvalidState("component value exceeds u64 canonical event limit".to_string())
+                KernelXError::InvalidState(
+                    "component value exceeds u64 canonical event limit".to_string(),
+                )
             })?;
             components.push(value);
         }
@@ -75,7 +77,7 @@ impl<S: KernelStore> KernelEngine<S> {
     }
 
     fn latest_parent_hash_for_entity(&self, entity_id: &str) -> Result<Vec<String>, KernelXError> {
-        let mut events = self.store.list_events()?;
+        let mut events = self.store.load_events_for_replay()?;
         events.sort_by(|a, b| {
             a.logical_clock
                 .cmp(&b.logical_clock)
@@ -91,6 +93,25 @@ impl<S: KernelStore> KernelEngine<S> {
             .map(|event| event.event_hash);
 
         Ok(parent.into_iter().collect())
+    }
+
+    fn next_event_sequence_for_entity(
+        &self,
+        entity_id: &str,
+        region_id: &str,
+    ) -> Result<u64, KernelXError> {
+        let events = self.store.load_events_for_replay()?;
+        let count = events
+            .iter()
+            .filter(|event| event.entity_id == entity_id && event.region_id == region_id)
+            .count();
+
+        let next = count
+            .checked_add(1)
+            .ok_or_else(|| KernelXError::InvalidState("event sequence overflow".to_string()))?;
+
+        u64::try_from(next)
+            .map_err(|_| KernelXError::InvalidState("event sequence overflow".to_string()))
     }
 
     fn build_transition_event(
@@ -115,8 +136,17 @@ impl<S: KernelStore> KernelEngine<S> {
         let auth_ratio = after.certification.auth_ratio as f64 / 1000.0;
         let certified = after.certification.certified;
 
+        let sequence = self.next_event_sequence_for_entity(&after.vector_id, &after.space_id)?;
+        let event_id = VectorEvent::canonical_event_id(
+            &after.vector_id,
+            &after.space_id,
+            &operation,
+            logical_clock,
+            sequence,
+        );
+
         let mut event = VectorEvent::new(
-            format!("{}::{}::{}", after.vector_id, after.version, logical_clock),
+            event_id,
             parent_hashes,
             after.space_id.clone(),
             after.vector_id.clone(),
@@ -135,8 +165,21 @@ impl<S: KernelStore> KernelEngine<S> {
         Ok(event)
     }
 
+    fn ensure_parent_closure(&self, event: &VectorEvent) -> Result<(), KernelXError> {
+        for parent_hash in &event.parent_hashes {
+            if self.store.get_event_by_hash(parent_hash)?.is_none() {
+                return Err(KernelXError::InvalidState(format!(
+                    "orphan event {} references missing parent {}",
+                    event.event_hash, parent_hash
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn append_canonical_event(&mut self, event: VectorEvent) -> Result<(), KernelXError> {
         validate_event(&event)?;
+        self.ensure_parent_closure(&event)?;
         self.store.append_event(event)?;
         Ok(())
     }
@@ -263,8 +306,13 @@ impl<S: KernelStore> KernelEngine<S> {
         after_to.certification = certify_state(&after_to, true, true);
         self.store.put_state(after_from.clone())?;
         self.store.put_state(after_to.clone())?;
-        let (mut sender_record, mut receiver_record) =
-            transfer_record(before_from, before_to, after_from.clone(), after_to.clone(), amount);
+        let (mut sender_record, mut receiver_record) = transfer_record(
+            &before_from,
+            &before_to,
+            &after_from,
+            &after_to,
+            amount,
+        );
         sender_record.certification = after_from.certification.clone();
         receiver_record.certification = after_to.certification.clone();
         if accept_record(&sender_record, &self.consensus) {
@@ -297,37 +345,51 @@ impl<S: KernelStore> KernelEngine<S> {
         Ok((after_from, after_to))
     }
 
-    pub fn drain(&mut self, vector_id: &str, basis_points: u16) -> Result<VectorStateV1, KernelXError> {
+    pub fn drain(
+        &mut self,
+        vector_id: &str,
+        basis_points: u16,
+    ) -> Result<VectorStateV1, KernelXError> {
         let mut state = self
             .store
             .get_state(vector_id)?
             .ok_or(KernelXError::VectorNotFound)?;
+
+        let before = state.clone();
+
         let (_drained, remaining) = apply_drain(
-            &state.components,
+            &before.components,
             basis_points,
-            state.certification.auth_ratio,
-            state.certification.threshold,
+            before.certification.auth_ratio,
+            before.certification.threshold,
         )?;
+
         state.components = remaining;
         state.certification = certify_state(&state, true, true);
         state.updated_at_ms = now_ms();
         state.version += 1;
         self.store.put_state(state.clone())?;
-        let record_params = serde_json::json!({ "basis_points": basis_points, "remaining": state.components.clone() });
+
+        let record_params = serde_json::json!({
+            "basis_points": basis_points,
+            "remaining": state.components.clone()
+        });
+
         let record = VectorRecordV1::new(
             make_record_id("drain", vector_id, record_params.to_string()),
             vector_id.to_string(),
-            None,
+            Some(before.clone()),
             state.clone(),
             OperationKind::Drain,
             record_params,
         );
+
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
         }
 
         let event = self.build_transition_event(
-            None,
+            Some(&before),
             &state,
             OperationType::Drain,
             state.version,
