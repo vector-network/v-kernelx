@@ -15,6 +15,9 @@ impl Default for ConsensusPolicy {
     }
 }
 
+/// Consensus here is intentionally limited to acceptance policy.
+/// It does not execute protocol semantics. It only decides whether a record
+/// is admissible under the local policy.
 pub fn accept_record(record: &VectorRecordV1, policy: &ConsensusPolicy) -> bool {
     if policy.require_certified && !record.certification.certified {
         return false;

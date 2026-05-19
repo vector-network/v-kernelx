@@ -1,17 +1,25 @@
 pub mod certification;
 pub mod consensus;
+pub mod dag;
 pub mod developer;
 pub mod drain;
 pub mod engine;
 pub mod error;
+pub mod event;
+pub mod ffi;
+pub mod hash;
 pub mod interpreter;
 pub mod origin;
 pub mod projection;
 pub mod python_api;
 pub mod query;
-pub mod record;
 pub mod reconstruction;
+pub mod record;
+pub mod replay;
 pub mod sdk;
+pub mod serialization;
+pub mod signature;
+pub mod snapshot;
 pub mod state;
 pub mod storage;
 pub mod transfer;
@@ -20,18 +28,26 @@ pub mod wallet;
 
 pub use certification::*;
 pub use consensus::*;
+pub use dag::*;
 pub use developer::*;
 pub use drain::*;
 pub use engine::*;
 pub use error::*;
+pub use event::{ExecutionResult, OperationType, VectorEvent, VectorState};
+pub use ffi::*;
+pub use hash::*;
 pub use interpreter::*;
 pub use origin::*;
 pub use projection::*;
 pub use python_api::*;
 pub use query::*;
-pub use record::*;
 pub use reconstruction::*;
+pub use record::*;
+pub use replay::*;
 pub use sdk::*;
+pub use serialization::*;
+pub use signature::*;
+pub use snapshot::*;
 pub use state::*;
 pub use storage::*;
 pub use transfer::*;
@@ -56,18 +72,26 @@ fn exposed_modules() -> Vec<&'static str> {
     vec![
         "certification",
         "consensus",
+        "dag",
         "developer",
         "drain",
         "engine",
         "error",
+        "event",
+        "ffi",
+        "hash",
         "interpreter",
         "origin",
         "projection",
         "python_api",
         "query",
-        "record",
         "reconstruction",
+        "record",
+        "replay",
         "sdk",
+        "serialization",
+        "signature",
+        "snapshot",
         "state",
         "storage",
         "transfer",

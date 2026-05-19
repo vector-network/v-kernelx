@@ -9,6 +9,10 @@ pub fn compute_auth_ratio(state: &VectorStateV1, ownership_verified: bool, struc
     total.min(1000) as u16
 }
 
+pub fn compute_auth_ratio_unit(state: &VectorStateV1, ownership_verified: bool, structure_verified: bool) -> f64 {
+    compute_auth_ratio(state, ownership_verified, structure_verified) as f64 / 1000.0
+}
+
 pub fn certify_state(
     state: &VectorStateV1,
     ownership_verified: bool,
@@ -27,4 +31,8 @@ pub fn certify_state(
             Some(format!("auth_ratio {} below threshold {}", auth_ratio, threshold))
         },
     }
+}
+
+pub fn is_certified(state: &VectorStateV1) -> bool {
+    state.certification.certified
 }

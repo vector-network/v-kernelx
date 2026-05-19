@@ -37,6 +37,7 @@ pub fn transfer_components(
 
     sender.vector_type = VectorType::Standard;
     receiver.vector_type = VectorType::Standard;
+
     Ok((sender, receiver))
 }
 
@@ -49,8 +50,18 @@ pub fn transfer_record(
 ) -> (VectorRecordV1, VectorRecordV1) {
     let sender_cert = certify_state(&after_from, true, true);
     let receiver_cert = certify_state(&after_to, true, true);
-    let sender_params = json!({ "direction": "out", "amount": amount.clone(), "version": after_from.version });
-    let receiver_params = json!({ "direction": "in", "amount": amount, "version": after_to.version });
+
+    let sender_params = json!({
+        "direction": "out",
+        "amount": amount.clone(),
+        "version": after_from.version
+    });
+    let receiver_params = json!({
+        "direction": "in",
+        "amount": amount,
+        "version": after_to.version
+    });
+
     let sender = VectorRecordV1::new(
         make_record_id("transfer-out", &after_from.vector_id, sender_params.to_string()),
         after_from.vector_id.clone(),
@@ -67,9 +78,11 @@ pub fn transfer_record(
         OperationKind::Transfer,
         receiver_params,
     );
+
     let mut sender = sender;
     let mut receiver = receiver;
     sender.certification = sender_cert;
     receiver.certification = receiver_cert;
+
     (sender, receiver)
 }

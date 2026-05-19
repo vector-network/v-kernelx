@@ -23,6 +23,7 @@ pub fn reconstruct_vector(
         return Err(KernelXError::DimensionMismatch);
     }
 
+    let settled_at_ms = now_ms();
     let mut restored = state.components.clone();
     let mut settled = Vec::with_capacity(projection.projected_components.len());
 
@@ -39,8 +40,10 @@ pub fn reconstruct_vector(
                 "loss exceeds projected value".to_string(),
             ));
         }
+
         let net = after_gain - *loss;
         settled.push(net);
+
         if let Some(slot) = restored.get_mut(index) {
             *slot = slot.saturating_add(net);
         } else {
@@ -49,15 +52,18 @@ pub fn reconstruct_vector(
     }
 
     state.components = restored;
+
     if let Some(mut p) = state.projection {
         p.settled_components = settled;
-        p.settlement_at_ms = Some(now_ms());
+        p.settlement_at_ms = Some(settled_at_ms);
         p.outcome_tag = Some(outcome.outcome_tag);
         state.projection = Some(p);
     }
+
     state.vector_type = VectorType::Settlement;
     state.status = VectorStatus::Settled;
-    state.updated_at_ms = now_ms();
+    state.updated_at_ms = settled_at_ms;
     state.version += 1;
+
     Ok(state)
 }

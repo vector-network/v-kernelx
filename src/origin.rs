@@ -1,12 +1,11 @@
 use crate::error::KernelXError;
 use crate::state::{now_ms, OriginState, VectorStateV1, VectorType};
-use sha2::{Digest, Sha256};
 
 pub fn origin_proof_hash(seed: &str, nonce: u64) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(seed.as_bytes());
-    hasher.update(nonce.to_le_bytes());
-    hex::encode(hasher.finalize())
+    hasher.update(&nonce.to_be_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 pub fn verify_origin(seed: &str, nonce: u64, difficulty: u32) -> bool {
@@ -35,9 +34,11 @@ pub fn create_origin_vector(
     if !verify_origin(&seed, nonce, difficulty) {
         return Err(KernelXError::OriginRejected);
     }
+
     let timestamp = now_ms();
     let vector_id = vector_id.into();
     let proof_hash = origin_proof_hash(&seed, nonce);
+
     let mut state = VectorStateV1::new(
         vector_id.clone(),
         owner_pubkey,
@@ -46,6 +47,7 @@ pub fn create_origin_vector(
         VectorType::Origin,
         timestamp,
     );
+
     state.origin = Some(OriginState {
         seed,
         nonce,
@@ -55,5 +57,6 @@ pub fn create_origin_vector(
     state.certification.certified = true;
     state.certification.auth_ratio = 1000;
     state.certification.reason = None;
+
     Ok(state)
 }

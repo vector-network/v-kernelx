@@ -2,19 +2,23 @@ use crate::certification::certify_state;
 use crate::consensus::{accept_record, ConsensusPolicy};
 use crate::drain::apply_drain;
 use crate::error::KernelXError;
+use crate::event::{OperationType, VectorEvent, VectorState};
+use crate::hash::{canonical_event_hash, canonical_payload_hash};
 use crate::origin::create_origin_vector;
 use crate::projection::project_vector;
-use crate::query::{get_vector, list_records, list_vectors};
+use crate::query::{get_event_by_hash, get_vector, list_records, list_vectors};
 use crate::record::{make_record_id, OperationKind, VectorRecordV1};
 use crate::reconstruction::SettlementOutcome;
 use crate::reconstruction::reconstruct_vector;
-use crate::state::{now_ms, VectorStateV1};
-use crate::storage::{MemoryStore, StateStore};
+use crate::replay::{replay_events, ReplayResult};
+use crate::serialization::canonical_event_payload_bytes;
+use crate::state::{compute_state_root, now_ms, StateRoot, VectorStateV1};
+use crate::storage::{EventStore, KernelStore, MemoryStore, ReplayStore, StateStore};
 use crate::transfer::{transfer_components, transfer_record};
-use crate::validation::validate_state;
+use crate::validation::{validate_event, validate_state};
 
 #[derive(Clone)]
-pub struct KernelEngine<S: StateStore> {
+pub struct KernelEngine<S: KernelStore> {
     pub store: S,
     pub consensus: ConsensusPolicy,
 }
@@ -28,12 +32,124 @@ impl KernelEngine<MemoryStore> {
     }
 }
 
-impl<S: StateStore> KernelEngine<S> {
+impl<S: KernelStore> KernelEngine<S> {
     pub fn with_store(store: S) -> Self {
         Self {
             store,
             consensus: ConsensusPolicy::default(),
         }
+    }
+
+    fn op_kind_to_event_kind(kind: &OperationKind) -> OperationType {
+        match kind {
+            OperationKind::OriginCreate => OperationType::OriginCreate,
+            OperationKind::Certify => OperationType::Certify,
+            OperationKind::Transfer => OperationType::Transfer,
+            OperationKind::Drain => OperationType::Drain,
+            OperationKind::Project => OperationType::Project,
+            OperationKind::Reconstruct => OperationType::Reconstruct,
+            OperationKind::Other(name) => OperationType::Other(name.clone()),
+        }
+    }
+
+    fn vector_v1_to_event_state(state: &VectorStateV1) -> Result<VectorState, KernelXError> {
+        let mut components = Vec::with_capacity(state.components.len());
+        for component in &state.components {
+            let value = u64::try_from(*component).map_err(|_| {
+                KernelXError::InvalidState("component value exceeds u64 canonical event limit".to_string())
+            })?;
+            components.push(value);
+        }
+
+        let mut metadata = std::collections::BTreeMap::new();
+        for (k, v) in &state.type_metadata {
+            metadata.insert(k.clone(), v.clone());
+        }
+
+        Ok(VectorState::new(
+            components,
+            state.owner_pubkey.clone(),
+            format!("{:?}", state.vector_type),
+            metadata,
+        ))
+    }
+
+    fn latest_parent_hash_for_entity(&self, entity_id: &str) -> Result<Vec<String>, KernelXError> {
+        let mut events = self.store.list_events()?;
+        events.sort_by(|a, b| {
+            a.logical_clock
+                .cmp(&b.logical_clock)
+                .then_with(|| a.timestamp.cmp(&b.timestamp))
+                .then_with(|| a.event_hash.cmp(&b.event_hash))
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+
+        let parent = events
+            .into_iter()
+            .rev()
+            .find(|event| event.entity_id == entity_id)
+            .map(|event| event.event_hash);
+
+        Ok(parent.into_iter().collect())
+    }
+
+    fn build_transition_event(
+        &self,
+        before: Option<&VectorStateV1>,
+        after: &VectorStateV1,
+        operation: OperationType,
+        logical_clock: u64,
+        timestamp: u64,
+        parent_hashes: Vec<String>,
+    ) -> Result<VectorEvent, KernelXError> {
+        let vector_before = match before {
+            Some(state) => Self::vector_v1_to_event_state(state)?,
+            None => VectorState::zero(
+                after.components.len(),
+                after.owner_pubkey.clone(),
+                format!("{:?}", after.vector_type),
+            ),
+        };
+
+        let vector_after = Self::vector_v1_to_event_state(after)?;
+        let auth_ratio = after.certification.auth_ratio as f64 / 1000.0;
+        let certified = after.certification.certified;
+
+        let mut event = VectorEvent::new(
+            format!("{}::{}::{}", after.vector_id, after.version, logical_clock),
+            parent_hashes,
+            after.space_id.clone(),
+            after.vector_id.clone(),
+            operation,
+            vector_before,
+            vector_after,
+            auth_ratio,
+            certified,
+            after.owner_pubkey.clone(),
+            logical_clock,
+            timestamp,
+        );
+
+        event.payload_hash = canonical_payload_hash(&event);
+        event.event_hash = canonical_event_hash(&event);
+        Ok(event)
+    }
+
+    fn append_canonical_event(&mut self, event: VectorEvent) -> Result<(), KernelXError> {
+        validate_event(&event)?;
+        self.store.append_event(event)?;
+        Ok(())
+    }
+
+    pub fn replay_canonical_history(&self) -> Result<ReplayResult, KernelXError> {
+        let events = self.store.load_events_for_replay()?;
+        replay_events(&events).map_err(KernelXError::InvalidState)
+    }
+
+    pub fn current_state_root(&self) -> Result<StateRoot, KernelXError> {
+        let states = self.store.list_states()?;
+        let logical_clock = states.iter().map(|s| s.updated_at_ms).max().unwrap_or(0);
+        Ok(compute_state_root(&states, logical_clock))
     }
 
     pub fn certify(&mut self, vector_id: &str) -> Result<VectorStateV1, KernelXError> {
@@ -47,9 +163,13 @@ impl<S: StateStore> KernelEngine<S> {
         updated.version += 1;
         self.store.put_state(updated.clone())?;
         let record = VectorRecordV1::new(
-            make_record_id("certify", vector_id, format!("version={};auth={}", updated.version, updated.certification.auth_ratio)),
+            make_record_id(
+                "certify",
+                vector_id,
+                format!("version={};auth={}", updated.version, updated.certification.auth_ratio),
+            ),
             vector_id.to_string(),
-            Some(state),
+            Some(state.clone()),
             updated.clone(),
             OperationKind::Certify,
             serde_json::json!({}),
@@ -57,6 +177,17 @@ impl<S: StateStore> KernelEngine<S> {
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
         }
+
+        let event = self.build_transition_event(
+            Some(&state),
+            &updated,
+            OperationType::Certify,
+            updated.version,
+            updated.updated_at_ms,
+            self.latest_parent_hash_for_entity(&updated.vector_id)?,
+        )?;
+        self.append_canonical_event(event)?;
+
         Ok(updated)
     }
 
@@ -83,7 +214,11 @@ impl<S: StateStore> KernelEngine<S> {
         state.certification = certify_state(&state, true, true);
         self.store.put_state(state.clone())?;
         let record = VectorRecordV1::new(
-            make_record_id("origin", &state.vector_id, format!("difficulty={};version={}", difficulty, state.version)),
+            make_record_id(
+                "origin",
+                &state.vector_id,
+                format!("difficulty={};version={}", difficulty, state.version),
+            ),
             state.vector_id.clone(),
             None,
             state.clone(),
@@ -93,6 +228,17 @@ impl<S: StateStore> KernelEngine<S> {
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
         }
+
+        let event = self.build_transition_event(
+            None,
+            &state,
+            OperationType::OriginCreate,
+            state.version,
+            state.created_at_ms,
+            Vec::new(),
+        )?;
+        self.append_canonical_event(event)?;
+
         Ok(state)
     }
 
@@ -102,8 +248,14 @@ impl<S: StateStore> KernelEngine<S> {
         to_id: &str,
         amount: Vec<u128>,
     ) -> Result<(VectorStateV1, VectorStateV1), KernelXError> {
-        let from = self.store.get_state(from_id)?.ok_or(KernelXError::VectorNotFound)?;
-        let to = self.store.get_state(to_id)?.ok_or(KernelXError::VectorNotFound)?;
+        let from = self
+            .store
+            .get_state(from_id)?
+            .ok_or(KernelXError::VectorNotFound)?;
+        let to = self
+            .store
+            .get_state(to_id)?
+            .ok_or(KernelXError::VectorNotFound)?;
         let before_from = from.clone();
         let before_to = to.clone();
         let (mut after_from, mut after_to) = transfer_components(from, to, amount.clone())?;
@@ -121,12 +273,41 @@ impl<S: StateStore> KernelEngine<S> {
         if accept_record(&receiver_record, &self.consensus) {
             self.store.put_record(receiver_record)?;
         }
+
+        let sender_event = self.build_transition_event(
+            Some(&before_from),
+            &after_from,
+            OperationType::Transfer,
+            after_from.version,
+            now_ms(),
+            self.latest_parent_hash_for_entity(&after_from.vector_id)?,
+        )?;
+        self.append_canonical_event(sender_event)?;
+
+        let receiver_event = self.build_transition_event(
+            Some(&before_to),
+            &after_to,
+            OperationType::Transfer,
+            after_to.version,
+            now_ms(),
+            self.latest_parent_hash_for_entity(&after_to.vector_id)?,
+        )?;
+        self.append_canonical_event(receiver_event)?;
+
         Ok((after_from, after_to))
     }
 
     pub fn drain(&mut self, vector_id: &str, basis_points: u16) -> Result<VectorStateV1, KernelXError> {
-        let mut state = self.store.get_state(vector_id)?.ok_or(KernelXError::VectorNotFound)?;
-        let (drained, remaining) = apply_drain(&state.components, basis_points, state.certification.auth_ratio, state.certification.threshold)?;
+        let mut state = self
+            .store
+            .get_state(vector_id)?
+            .ok_or(KernelXError::VectorNotFound)?;
+        let (_drained, remaining) = apply_drain(
+            &state.components,
+            basis_points,
+            state.certification.auth_ratio,
+            state.certification.threshold,
+        )?;
         state.components = remaining;
         state.certification = certify_state(&state, true, true);
         state.updated_at_ms = now_ms();
@@ -144,6 +325,17 @@ impl<S: StateStore> KernelEngine<S> {
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
         }
+
+        let event = self.build_transition_event(
+            None,
+            &state,
+            OperationType::Drain,
+            state.version,
+            state.updated_at_ms,
+            self.latest_parent_hash_for_entity(&state.vector_id)?,
+        )?;
+        self.append_canonical_event(event)?;
+
         Ok(state)
     }
 
@@ -153,15 +345,23 @@ impl<S: StateStore> KernelEngine<S> {
         projected_components: Vec<u128>,
         escrow_id: impl Into<String>,
     ) -> Result<VectorStateV1, KernelXError> {
-        let state = self.store.get_state(vector_id)?.ok_or(KernelXError::VectorNotFound)?;
+        let state = self
+            .store
+            .get_state(vector_id)?
+            .ok_or(KernelXError::VectorNotFound)?;
         let before = state.clone();
         let mut after = project_vector(state, projected_components.clone(), escrow_id)?;
         after.certification = certify_state(&after, true, true);
         self.store.put_state(after.clone())?;
         let record = VectorRecordV1::new(
-            make_record_id("project", vector_id, serde_json::to_string(&serde_json::json!({ "projected_components": projected_components })).unwrap_or_default()),
+            make_record_id(
+                "project",
+                vector_id,
+                serde_json::to_string(&serde_json::json!({ "projected_components": projected_components }))
+                    .unwrap_or_default(),
+            ),
             vector_id.to_string(),
-            Some(before),
+            Some(before.clone()),
             after.clone(),
             OperationKind::Project,
             serde_json::json!({ "projected_components": projected_components }),
@@ -169,6 +369,17 @@ impl<S: StateStore> KernelEngine<S> {
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
         }
+
+        let event = self.build_transition_event(
+            Some(&before),
+            &after,
+            OperationType::Project,
+            after.version,
+            after.updated_at_ms,
+            self.latest_parent_hash_for_entity(&after.vector_id)?,
+        )?;
+        self.append_canonical_event(event)?;
+
         Ok(after)
     }
 
@@ -177,7 +388,10 @@ impl<S: StateStore> KernelEngine<S> {
         vector_id: &str,
         outcome: SettlementOutcome,
     ) -> Result<VectorStateV1, KernelXError> {
-        let state = self.store.get_state(vector_id)?.ok_or(KernelXError::VectorNotFound)?;
+        let state = self
+            .store
+            .get_state(vector_id)?
+            .ok_or(KernelXError::VectorNotFound)?;
         let before = state.clone();
         let outcome_tag = outcome.outcome_tag.clone();
         let gains = outcome.gains.clone();
@@ -189,7 +403,7 @@ impl<S: StateStore> KernelEngine<S> {
         let record = VectorRecordV1::new(
             make_record_id("reconstruct", vector_id, record_params.to_string()),
             vector_id.to_string(),
-            Some(before),
+            Some(before.clone()),
             after.clone(),
             OperationKind::Reconstruct,
             record_params,
@@ -197,6 +411,17 @@ impl<S: StateStore> KernelEngine<S> {
         if accept_record(&record, &self.consensus) {
             self.store.put_record(record)?;
         }
+
+        let event = self.build_transition_event(
+            Some(&before),
+            &after,
+            OperationType::Reconstruct,
+            after.version,
+            after.updated_at_ms,
+            self.latest_parent_hash_for_entity(&after.vector_id)?,
+        )?;
+        self.append_canonical_event(event)?;
+
         Ok(after)
     }
 
@@ -210,5 +435,9 @@ impl<S: StateStore> KernelEngine<S> {
 
     pub fn query_records(&self) -> Result<Vec<VectorRecordV1>, KernelXError> {
         list_records(&self.store)
+    }
+
+    pub fn query_event_by_hash(&self, event_hash: &str) -> Result<Option<VectorEvent>, KernelXError> {
+        get_event_by_hash(&self.store, event_hash)
     }
 }

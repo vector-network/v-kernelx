@@ -9,9 +9,16 @@ pub fn project_vector(
     if projected_components.len() != state.components.len() {
         return Err(KernelXError::DimensionMismatch);
     }
-    if projected_components.iter().zip(state.components.iter()).any(|(p, c)| p > c) {
+
+    if projected_components
+        .iter()
+        .zip(state.components.iter())
+        .any(|(p, c)| p > c)
+    {
         return Err(KernelXError::InsufficientBalance);
     }
+
+    let started_at_ms = now_ms();
 
     let remainder: Vec<u128> = state
         .components
@@ -27,11 +34,12 @@ pub fn project_vector(
         escrow_id: escrow_id.into(),
         projected_components,
         settled_components: Vec::new(),
-        started_at_ms: now_ms(),
+        started_at_ms,
         settlement_at_ms: None,
         outcome_tag: None,
     });
-    state.updated_at_ms = now_ms();
+    state.updated_at_ms = started_at_ms;
     state.version += 1;
+
     Ok(state)
 }

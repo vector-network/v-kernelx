@@ -26,4 +26,12 @@ pub enum KernelXError {
     OriginRejected,
     #[error("settlement rejected: {0}")]
     SettlementRejected(String),
+    #[error("replay failed: {0}")]
+    Replay(String),
+    #[error("snapshot error: {0}")]
+    Snapshot(String),
+    #[error("serialization error: {0}")]
+    Serialization(String),
+    #[error("validation error: {0}")]
+    Validation(String),
 }

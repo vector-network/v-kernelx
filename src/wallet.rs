@@ -44,17 +44,20 @@ impl WalletContext {
     }
 }
 
+pub fn verifying_key_from_hex(public_key_hex: &str) -> Result<VerifyingKey, KernelXError> {
+    let pk_bytes = hex::decode(public_key_hex).map_err(|_| KernelXError::Signature)?;
+    let pk_array: [u8; 32] = pk_bytes.try_into().map_err(|_| KernelXError::Signature)?;
+    VerifyingKey::from_bytes(&pk_array).map_err(|_| KernelXError::Signature)
+}
+
 pub fn verify_signature(
     public_key_hex: &str,
     message: &[u8],
     signature_hex: &str,
 ) -> Result<(), KernelXError> {
-    let pk_bytes = hex::decode(public_key_hex).map_err(|_| KernelXError::Signature)?;
+    let verifying_key = verifying_key_from_hex(public_key_hex)?;
     let sig_bytes = hex::decode(signature_hex).map_err(|_| KernelXError::Signature)?;
-    let pk_array: [u8; 32] = pk_bytes.try_into().map_err(|_| KernelXError::Signature)?;
-    let sig_array: [u8; 64] = sig_bytes.try_into().map_err(|_| KernelXError::Signature)?;
-    let verifying_key = VerifyingKey::from_bytes(&pk_array).map_err(|_| KernelXError::Signature)?;
-    let signature = Signature::from_bytes(&sig_array);
+    let signature = Signature::from_slice(&sig_bytes).map_err(|_| KernelXError::Signature)?;
     verifying_key
         .verify(message, &signature)
         .map_err(|_| KernelXError::Signature)

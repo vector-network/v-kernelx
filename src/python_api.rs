@@ -133,4 +133,31 @@ impl PyKernelEngine {
 
         to_json(&result)
     }
+
+    pub fn query_event_by_hash(&self, event_hash: String) -> PyResult<String> {
+        let result = self
+            .inner
+            .query_event_by_hash(&event_hash)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        to_json(&result)
+    }
+
+    pub fn replay_canonical_history(&self) -> PyResult<String> {
+        let result = self
+            .inner
+            .replay_canonical_history()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        to_json(&result)
+    }
+
+    pub fn current_state_root(&self) -> PyResult<String> {
+        let result = self
+            .inner
+            .current_state_root()
+            .map_err(|err| PyValueError::new_err(err.to_string()))?;
+
+        to_json(&result)
+    }
 }

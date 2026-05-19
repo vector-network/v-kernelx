@@ -75,6 +75,14 @@ pub struct DirectionShare {
     pub denominator: u128,
 }
 
+/// Canonical state root for kernel-side state snapshots and replay verification.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StateRoot {
+    pub root_hash: String,
+    pub event_count: u64,
+    pub logical_clock: u64,
+}
+
 impl VectorStateV1 {
     pub fn new(
         vector_id: impl Into<String>,
@@ -152,6 +160,175 @@ impl VectorStateV1 {
         self.updated_at_ms = timestamp_ms;
         self.version += 1;
         self
+    }
+}
+
+fn write_u8(buf: &mut Vec<u8>, v: u8) {
+    buf.push(v);
+}
+
+fn write_bool(buf: &mut Vec<u8>, v: bool) {
+    write_u8(buf, if v { 1 } else { 0 });
+}
+
+fn write_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_be_bytes());
+}
+
+fn write_u128(buf: &mut Vec<u8>, v: u128) {
+    buf.extend_from_slice(&v.to_be_bytes());
+}
+
+fn write_str(buf: &mut Vec<u8>, value: &str) {
+    let bytes = value.as_bytes();
+    write_u64(buf, bytes.len() as u64);
+    buf.extend_from_slice(bytes);
+}
+
+fn write_vec_u128(buf: &mut Vec<u8>, values: &[u128]) {
+    write_u64(buf, values.len() as u64);
+    for v in values {
+        write_u128(buf, *v);
+    }
+}
+
+fn write_btreemap_str_str(buf: &mut Vec<u8>, map: &BTreeMap<String, String>) {
+    write_u64(buf, map.len() as u64);
+    for (k, v) in map {
+        write_str(buf, k);
+        write_str(buf, v);
+    }
+}
+
+fn write_vector_type(buf: &mut Vec<u8>, value: &VectorType) {
+    let tag = match value {
+        VectorType::Standard => "STANDARD",
+        VectorType::Origin => "ORIGIN",
+        VectorType::Projected => "PROJECTED",
+        VectorType::Escrow => "ESCROW",
+        VectorType::Settlement => "SETTLEMENT",
+        VectorType::Locked => "LOCKED",
+    };
+    write_str(buf, tag);
+}
+
+fn write_vector_status(buf: &mut Vec<u8>, value: &VectorStatus) {
+    let tag = match value {
+        VectorStatus::Active => "ACTIVE",
+        VectorStatus::Projected => "PROJECTED",
+        VectorStatus::Escrowed => "ESCROWED",
+        VectorStatus::Settled => "SETTLED",
+        VectorStatus::Archived => "ARCHIVED",
+    };
+    write_str(buf, tag);
+}
+
+fn write_certification_state(buf: &mut Vec<u8>, value: &CertificationState) {
+    write_bool(buf, value.certified);
+    write_u64(buf, value.auth_ratio as u64);
+    write_u64(buf, value.threshold as u64);
+    write_u64(buf, value.last_checked_at_ms);
+    match &value.reason {
+        Some(reason) => {
+            write_bool(buf, true);
+            write_str(buf, reason);
+        }
+        None => write_bool(buf, false),
+    }
+}
+
+fn write_projection_state(buf: &mut Vec<u8>, value: &ProjectionState) {
+    write_str(buf, &value.escrow_id);
+    write_vec_u128(buf, &value.projected_components);
+    write_vec_u128(buf, &value.settled_components);
+    write_u64(buf, value.started_at_ms);
+    match value.settlement_at_ms {
+        Some(ts) => {
+            write_bool(buf, true);
+            write_u64(buf, ts);
+        }
+        None => write_bool(buf, false),
+    }
+    match &value.outcome_tag {
+        Some(tag) => {
+            write_bool(buf, true);
+            write_str(buf, tag);
+        }
+        None => write_bool(buf, false),
+    }
+}
+
+fn write_origin_state(buf: &mut Vec<u8>, value: &OriginState) {
+    write_str(buf, &value.seed);
+    write_u64(buf, value.nonce);
+    write_u64(buf, value.difficulty as u64);
+    write_str(buf, &value.proof_hash);
+}
+
+fn canonical_vector_state_bytes(state: &VectorStateV1) -> Vec<u8> {
+    let mut buf = Vec::new();
+
+    write_str(&mut buf, &state.schema);
+    write_str(&mut buf, &state.vector_id);
+    write_str(&mut buf, &state.owner_pubkey);
+    write_str(&mut buf, &state.space_id);
+    write_vector_type(&mut buf, &state.vector_type);
+    write_vector_status(&mut buf, &state.status);
+    write_vec_u128(&mut buf, &state.components);
+    write_btreemap_str_str(&mut buf, &state.type_metadata);
+    write_certification_state(&mut buf, &state.certification);
+
+    match &state.projection {
+        Some(projection) => {
+            write_bool(&mut buf, true);
+            write_projection_state(&mut buf, projection);
+        }
+        None => write_bool(&mut buf, false),
+    }
+
+    match &state.origin {
+        Some(origin) => {
+            write_bool(&mut buf, true);
+            write_origin_state(&mut buf, origin);
+        }
+        None => write_bool(&mut buf, false),
+    }
+
+    write_u64(&mut buf, state.version);
+    write_u64(&mut buf, state.created_at_ms);
+    write_u64(&mut buf, state.updated_at_ms);
+
+    buf
+}
+
+/// Deterministically compute a state root from the current state set.
+/// The state list is ordered by vector_id before hashing.
+pub fn compute_state_root(states: &[VectorStateV1], logical_clock: u64) -> StateRoot {
+    let mut ordered = states.to_vec();
+    ordered.sort_by(|a, b| {
+        a.vector_id
+            .cmp(&b.vector_id)
+            .then_with(|| a.version.cmp(&b.version))
+            .then_with(|| a.updated_at_ms.cmp(&b.updated_at_ms))
+    });
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"v-kernelx/state-root-v1");
+    write_u64(&mut bytes, ordered.len() as u64);
+    write_u64(&mut bytes, logical_clock);
+
+    for state in &ordered {
+        let canonical = canonical_vector_state_bytes(state);
+        write_u64(&mut bytes, canonical.len() as u64);
+        bytes.extend_from_slice(&canonical);
+    }
+
+    let root_hash = blake3::hash(&bytes).to_hex().to_string();
+
+    StateRoot {
+        root_hash,
+        event_count: ordered.len() as u64,
+        logical_clock,
     }
 }
 
