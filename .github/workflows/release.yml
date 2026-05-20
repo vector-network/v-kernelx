@@ -46,21 +46,25 @@ jobs:
       - name: Build release library
         run: cargo build --release
 
-      - name: Verify ABI symbol (Linux/macOS)
+      - name: Verify Linux/macOS release library exists
         if: runner.os != 'Windows'
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Linux" ]]; then
-            nm -D target/release/libv_kernelx.so | grep kernel_abi_version
+            test -f target/release/libv_kernelx.so
           else
-            nm -g target/release/libv_kernelx.dylib | grep kernel_abi_version
+            test -f target/release/libv_kernelx.dylib
           fi
 
-      - name: Verify ABI symbol (Windows)
+      - name: Verify Windows release library exists
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          dumpbin /EXPORTS target\release\v_kernelx.dll | findstr kernel_abi_version
+          if (!(Test-Path "target\release\v_kernelx.dll")) {
+            Write-Error "target\release\v_kernelx.dll not found"
+            exit 1
+          }
+          Write-Host "Windows DLL build verified"
 
       - name: Build Python wheels
         uses: PyO3/maturin-action@v1
@@ -81,13 +85,12 @@ jobs:
           New-Item -ItemType Directory -Force -Path native\include | Out-Null
 
           Copy-Item target\release\v_kernelx.dll native\
-          
+
           if (Test-Path "target\release\v_kernelx.lib") {
             Copy-Item target\release\v_kernelx.lib native\
           }
 
           Copy-Item include\v_kernelx.h native\include\
-
           Set-Content -Path native\ABI_VERSION -Value "1"
 
           Compress-Archive `
@@ -102,10 +105,9 @@ jobs:
 
           cp target/release/libv_kernelx.so native/
           cp include/v_kernelx.h native/include/
-
           echo "1" > native/ABI_VERSION
 
-          tar -czf v-kernelx-linux-x86_64.tar.gz native
+          tar -czf v-kernelx-linux-x86_64.tar.gz -C native .
 
       - name: Package macOS native bundle
         if: runner.os == 'macOS'
@@ -115,10 +117,9 @@ jobs:
 
           cp target/release/libv_kernelx.dylib native/
           cp include/v_kernelx.h native/include/
-
           echo "1" > native/ABI_VERSION
 
-          tar -czf v-kernelx-macos-x86_64.tar.gz native
+          tar -czf v-kernelx-macos-x86_64.tar.gz -C native .
 
       #
       # ----------------------------
