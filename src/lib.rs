@@ -15,6 +15,7 @@ pub mod python_api;
 pub mod query;
 pub mod reconstruction;
 pub mod record;
+pub mod region;
 pub mod replay;
 pub mod sdk;
 pub mod serialization;
@@ -43,6 +44,7 @@ pub use python_api::*;
 pub use query::*;
 pub use reconstruction::*;
 pub use record::*;
+pub use region::*;
 pub use sdk::*;
 pub use serialization::*;
 pub use signature::*;
@@ -52,8 +54,6 @@ pub use storage::*;
 pub use transfer::*;
 pub use validation::*;
 
-// Keep these modules public, but do not glob-reexport them here because they
-// create ambiguous root-level names with `state::*` and `signature::*`.
 pub use replay::compute_state_root as replay_compute_state_root;
 pub use wallet::verifying_key_from_hex as wallet_verifying_key_from_hex;
 
@@ -88,6 +88,7 @@ fn exposed_modules() -> Vec<&'static str> {
         "projection",
         "python_api",
         "query",
+        "region",
         "reconstruction",
         "record",
         "replay",

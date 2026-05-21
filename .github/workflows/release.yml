@@ -34,6 +34,15 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install MSYS2 toolchain
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-toolchain
+
       - name: Rust format check
         run: cargo fmt --all --check
 
@@ -44,7 +53,18 @@ jobs:
         run: cargo test
 
       - name: Build release library
+        if: runner.os != 'Windows'
         run: cargo build --release
+
+      - name: Build Windows GNU release library
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: gcc
+          CC_x86_64_pc_windows_gnu: gcc
+        run: |
+          rustup target add x86_64-pc-windows-gnu
+          cargo build --release --target x86_64-pc-windows-gnu
 
       - name: Verify Linux/macOS release library exists
         if: runner.os != 'Windows'
@@ -56,15 +76,24 @@ jobs:
             test -f target/release/libv_kernelx.dylib
           fi
 
-      - name: Verify Windows release library exists
+      - name: Verify Windows GNU release library exists
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          if (!(Test-Path "target\release\v_kernelx.dll")) {
-            Write-Error "target\release\v_kernelx.dll not found"
+          $dll = "target\x86_64-pc-windows-gnu\release\v_kernelx.dll"
+          $imp = "target\x86_64-pc-windows-gnu\release\libv_kernelx.dll.a"
+
+          if (!(Test-Path $dll)) {
+            Write-Error "$dll not found"
             exit 1
           }
-          Write-Host "Windows DLL build verified"
+
+          if (!(Test-Path $imp)) {
+            Write-Error "$imp not found"
+            exit 1
+          }
+
+          Write-Host "Windows GNU build verified"
 
       - name: Build Python wheels
         uses: PyO3/maturin-action@v1
@@ -84,13 +113,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path native\include | Out-Null
 
-          Copy-Item target\release\v_kernelx.dll native\
-
-          if (Test-Path "target\release\v_kernelx.lib") {
-            Copy-Item target\release\v_kernelx.lib native\
-          }
-
+          Copy-Item target\x86_64-pc-windows-gnu\release\v_kernelx.dll native\
+          Copy-Item target\x86_64-pc-windows-gnu\release\libv_kernelx.dll.a native\
           Copy-Item include\v_kernelx.h native\include\
+
           Set-Content -Path native\ABI_VERSION -Value "1"
 
           Compress-Archive `

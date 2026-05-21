@@ -1,13 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-// Compatibility shim: the canonical StateRoot currently lives in `state.rs`.
 pub use crate::state::StateRoot;
 
-/// Canonical operation classes.
-///
-/// Keep the set closed and deterministic. If you need a new operation, add it
-/// here and patch every execution path in the kernel alongside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
 pub enum OperationType {
@@ -48,11 +43,6 @@ impl OperationType {
     }
 }
 
-/// Canonical vector state.
-///
-/// This scaffold uses u64 components to keep accounting deterministic and
-/// serialization-friendly. If your current kernel already uses another numeric
-/// representation, I will patch this to match it exactly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VectorState {
     pub components: Vec<u64>,
@@ -100,42 +90,22 @@ impl VectorState {
     }
 }
 
-/// Canonical immutable protocol event.
-///
-/// Hashes and signatures are stored on the event, but they are not trusted unless
-/// independently verified.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorEvent {
     pub event_id: String,
     pub parent_hashes: Vec<String>,
-
     pub region_id: String,
     pub entity_id: String,
-
     pub operation: OperationType,
-
     pub vector_before: VectorState,
     pub vector_after: VectorState,
-
-    /// Kept as f64 for the current scaffold. The next patch can move protocol
-    /// accounting to fixed-point integers if your existing kernel already does that.
     pub auth_ratio: f64,
     pub certified: bool,
-
-    /// Raw public key bytes are expected to be hex-encoded here.
     pub actor_public_key: String,
-
     pub logical_clock: u64,
     pub timestamp: u64,
-
-    /// Hash of the canonical event payload.
     pub payload_hash: String,
-
-    /// Hash of the full canonical event record, excluding signature.
     pub event_hash: String,
-
-    /// Ed25519 signature over the canonical payload or canonical event bytes,
-    /// depending on the execution policy you settle on in the patch.
     pub signature: String,
 }
 
@@ -174,11 +144,6 @@ impl VectorEvent {
         }
     }
 
-    /// Deterministic human-readable event ID builder.
-    ///
-    /// The sequence number must be computed from canonical history before the
-    /// event is appended. This keeps IDs stable and avoids collisions caused by
-    /// `vector_id::version::logical_clock` reuse.
     pub fn canonical_event_id(
         entity_id: &str,
         region_id: &str,
@@ -197,7 +162,6 @@ impl VectorEvent {
     }
 }
 
-/// Canonical execution result returned by the engine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionResult {
     pub event: VectorEvent,

@@ -1,12 +1,17 @@
 use crate::dag::{topological_order, validate_dag};
-use crate::event::VectorEvent;
-use crate::event::VectorState;
+use crate::engine::KernelEngine;
+use crate::event::{VectorEvent, VectorState};
 use crate::hash::{canonical_event_hash, canonical_payload_hash};
+use crate::reconstruction::SettlementOutcome;
 use crate::replay::{replay_events, ReplayResult};
 use crate::serialization::canonical_state_map_bytes;
 use crate::signature::{verify_event_signature, verifying_key_from_hex};
 use crate::state::{compute_state_root, VectorStateV1};
-use serde_json::json;
+use crate::storage::MemoryStore;
+use crate::transfer::transfer_components;
+use crate::validation::validate_event;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -14,23 +19,76 @@ use std::ptr;
 use std::sync::Mutex;
 
 struct KernelInner {
-    events: Vec<VectorEvent>,
+    engine: KernelEngine<MemoryStore>,
     last_error: Option<String>,
+    seen_request_ids: BTreeSet<String>,
 }
 
 pub struct KernelHandle {
     inner: Mutex<KernelInner>,
 }
 
-impl KernelHandle {
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(KernelInner {
-                events: Vec::new(),
-                last_error: None,
-            }),
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SubmitEventRequest {
+    request_id: String,
+    operation: String,
+    actor_public_key: String,
+    signature: String,
+    params: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReconstructRequest {
+    vector_id: String,
+    outcome_tag: String,
+    gains: Vec<u128>,
+    losses: Vec<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OriginCreateRequest {
+    vector_id: String,
+    owner_pubkey: String,
+    space_id: String,
+    components: Vec<u128>,
+    seed: String,
+    nonce: u64,
+    difficulty: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TransferRequest {
+    from_id: String,
+    to_id: String,
+    amount: Vec<u128>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DrainRequest {
+    vector_id: String,
+    basis_points: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ProjectRequest {
+    vector_id: String,
+    projected_components: Vec<u128>,
+    escrow_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CertifyRequest {
+    vector_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueryVectorRequest {
+    vector_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueryEventByHashRequest {
+    event_hash: String,
 }
 
 fn to_c_string(s: String) -> *mut c_char {
@@ -107,6 +165,117 @@ fn parse_event_list(input: &str) -> Result<Vec<VectorEvent>, String> {
     }
 }
 
+fn parse_submit_request(input: &str) -> Result<SubmitEventRequest, String> {
+    serde_json::from_str::<SubmitEventRequest>(input)
+        .map_err(|e| format!("submit request parse error: {e}"))
+}
+
+fn parse_submit_request_list(input: &str) -> Result<Vec<SubmitEventRequest>, String> {
+    if let Ok(v) = serde_json::from_str::<Vec<SubmitEventRequest>>(input) {
+        return Ok(v);
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(input).map_err(|e| format!("submit batch parse error: {e}"))?;
+
+    if let Some(requests) = value.get("requests") {
+        serde_json::from_value::<Vec<SubmitEventRequest>>(requests.clone())
+            .map_err(|e| format!("submit batch request parse error: {e}"))
+    } else {
+        Err("missing requests array".to_string())
+    }
+}
+
+fn canonical_submit_request_bytes(req: &SubmitEventRequest) -> Result<Vec<u8>, String> {
+    let mut payload = BTreeMap::new();
+    payload.insert("request_id".to_string(), req.request_id.clone());
+    payload.insert("operation".to_string(), req.operation.clone());
+    payload.insert("actor_public_key".to_string(), req.actor_public_key.clone());
+    payload.insert(
+        "params".to_string(),
+        serde_json::to_string(&req.params)
+            .map_err(|e| format!("canonical request serialization error: {e}"))?,
+    );
+    serde_json::to_vec(&payload).map_err(|e| format!("canonical request serialization error: {e}"))
+}
+
+fn operation_name(operation: &str) -> String {
+    operation.trim().to_ascii_lowercase()
+}
+
+fn validate_operation_shape(operation: &str, params: &Value) -> Result<(), String> {
+    match operation_name(operation).as_str() {
+        "origin_create" | "create" | "origin" => {
+            serde_json::from_value::<OriginCreateRequest>(params.clone())
+                .map_err(|e| format!("origin_create params invalid: {e}"))?;
+            Ok(())
+        }
+        "transfer" => {
+            serde_json::from_value::<TransferRequest>(params.clone())
+                .map_err(|e| format!("transfer params invalid: {e}"))?;
+            Ok(())
+        }
+        "drain" => {
+            serde_json::from_value::<DrainRequest>(params.clone())
+                .map_err(|e| format!("drain params invalid: {e}"))?;
+            Ok(())
+        }
+        "project" => {
+            serde_json::from_value::<ProjectRequest>(params.clone())
+                .map_err(|e| format!("project params invalid: {e}"))?;
+            Ok(())
+        }
+        "reconstruct" => {
+            serde_json::from_value::<ReconstructRequest>(params.clone())
+                .map_err(|e| format!("reconstruct params invalid: {e}"))?;
+            Ok(())
+        }
+        "certify" => {
+            serde_json::from_value::<CertifyRequest>(params.clone())
+                .map_err(|e| format!("certify params invalid: {e}"))?;
+            Ok(())
+        }
+        other => Err(format!("unsupported operation: {other}")),
+    }
+}
+
+fn validate_submit_request(
+    inner: &KernelInner,
+    request: &SubmitEventRequest,
+) -> Result<Value, String> {
+    if request.request_id.trim().is_empty() {
+        return Err("missing request_id".to_string());
+    }
+    if request.actor_public_key.trim().is_empty() {
+        return Err("missing actor_public_key".to_string());
+    }
+    if request.signature.trim().is_empty() {
+        return Err("missing signature".to_string());
+    }
+
+    validate_operation_shape(&request.operation, &request.params)?;
+
+    if inner.seen_request_ids.contains(&request.request_id) {
+        return Err(format!("duplicate request_id: {}", request.request_id));
+    }
+
+    let verifying_key = verifying_key_from_hex(&request.actor_public_key)?;
+    let bytes = canonical_submit_request_bytes(request)?;
+    let signature_ok = verify_event_signature(&verifying_key, &bytes, &request.signature)
+        .map_err(|e| format!("request signature verification error: {e}"))?;
+
+    if !signature_ok {
+        return Err("request signature verification failed".to_string());
+    }
+
+    Ok(json!({
+        "request_id": request.request_id,
+        "operation": request.operation,
+        "shape_ok": true,
+        "signature_ok": true
+    }))
+}
+
 fn validate_event_internal(event: &VectorEvent) -> Result<serde_json::Value, String> {
     let payload_hash = canonical_payload_hash(event);
     let event_hash = canonical_event_hash(event);
@@ -142,6 +311,16 @@ fn validate_event_internal(event: &VectorEvent) -> Result<serde_json::Value, Str
     }))
 }
 
+fn sort_events(events: &mut [VectorEvent]) {
+    events.sort_by(|a, b| {
+        a.logical_clock
+            .cmp(&b.logical_clock)
+            .then_with(|| a.timestamp.cmp(&b.timestamp))
+            .then_with(|| a.event_hash.cmp(&b.event_hash))
+            .then_with(|| a.event_id.cmp(&b.event_id))
+    });
+}
+
 fn compute_heads(events: &[VectorEvent]) -> Vec<String> {
     if events.is_empty() {
         return Vec::new();
@@ -175,11 +354,9 @@ fn replay_from_events(events: &[VectorEvent]) -> Result<serde_json::Value, Strin
     if ordered.is_empty() {
         let empty_state: BTreeMap<String, VectorState> = BTreeMap::new();
         let empty_states: [VectorStateV1; 0] = [];
-
-        // Harmless deterministic touch so the canonical serializer remains exercised.
         let _canonical_bytes = canonical_state_map_bytes(&empty_state);
-
         let state_root = compute_state_root(&empty_states, 0);
+
         return Ok(json!({
             "state_root": state_root,
             "replay_hash": "",
@@ -216,24 +393,97 @@ fn replay_from_events(events: &[VectorEvent]) -> Result<serde_json::Value, Strin
     }))
 }
 
+fn engine_events(inner: &KernelInner) -> Result<Vec<VectorEvent>, String> {
+    inner.engine.query_events().map_err(|e| format!("{e}"))
+}
+
+fn engine_replay_summary(inner: &KernelInner) -> Result<serde_json::Value, String> {
+    let replay = inner
+        .engine
+        .replay_canonical_history()
+        .map_err(|e| format!("{e}"))?;
+
+    let events = engine_events(inner)?;
+    let heads = compute_heads(&events);
+
+    Ok(json!({
+        "state_root": replay.state_root,
+        "replay_hash": replay.replay_hash,
+        "applied_event_hashes": replay.applied_event_hashes,
+        "final_state": replay.final_state,
+        "event_count": replay.applied_event_hashes.len() as u64,
+        "latest_clock": replay.state_root.logical_clock,
+        "heads": heads,
+        "verified": true
+    }))
+}
+
+fn collect_new_events(before: &[VectorEvent], after: &[VectorEvent]) -> Vec<VectorEvent> {
+    let before_hashes: BTreeSet<String> = before.iter().map(|e| e.event_hash.clone()).collect();
+    let mut new_events: Vec<VectorEvent> = after
+        .iter()
+        .filter(|event| !before_hashes.contains(&event.event_hash))
+        .cloned()
+        .collect();
+    sort_events(&mut new_events);
+    new_events
+}
+
+fn execute_and_collect<F>(
+    inner: &mut KernelInner,
+    operation: &str,
+    f: F,
+) -> Result<serde_json::Value, String>
+where
+    F: FnOnce(&mut KernelEngine<MemoryStore>) -> Result<serde_json::Value, String>,
+{
+    let before_events = engine_events(inner)?;
+    let operation_result = f(&mut inner.engine)?;
+    let after_events = engine_events(inner)?;
+    let new_events = collect_new_events(&before_events, &after_events);
+
+    if new_events.is_empty() {
+        return Err(format!(
+            "{operation} completed without emitting a canonical event"
+        ));
+    }
+
+    let replay = engine_replay_summary(inner)?;
+    let event_count = after_events.len() as u64;
+    let latest_clock = replay
+        .get("latest_clock")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    Ok(json!({
+        "accepted": true,
+        "operation": operation,
+        "result": operation_result,
+        "records": new_events,
+        "event_count": event_count,
+        "latest_clock": latest_clock,
+        "replay": replay
+    }))
+}
+
 fn kernel_not_implemented(name: &str) -> *mut c_char {
     err_json(format!(
         "{name} is not implemented yet in the embedded FFI layer"
     ))
 }
 
-/// Create a new embedded kernel handle.
 #[no_mangle]
 pub extern "C" fn kernel_init() -> *mut KernelHandle {
-    let handle = Box::new(KernelHandle::new());
+    let handle = Box::new(KernelHandle {
+        inner: Mutex::new(KernelInner {
+            engine: KernelEngine::new(),
+            last_error: None,
+            seen_request_ids: BTreeSet::new(),
+        }),
+    });
     Box::into_raw(handle)
 }
 
-/// Free the embedded kernel handle.
-///
-/// # Safety
-/// `handle` must either be null or a pointer previously returned by
-/// `kernel_init`. It must not be used again after this call.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_free(handle: *mut KernelHandle) {
     if handle.is_null() {
@@ -242,11 +492,6 @@ pub unsafe extern "C" fn kernel_free(handle: *mut KernelHandle) {
     drop(Box::from_raw(handle));
 }
 
-/// Return the last error string stored on the kernel handle.
-///
-/// # Safety
-/// `handle` must either be null or a valid pointer created by `kernel_init`.
-/// The returned string must be released with `kernel_string_free`.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_last_error(handle: *mut KernelHandle) -> *mut c_char {
     match last_error_string(handle) {
@@ -255,11 +500,6 @@ pub unsafe extern "C" fn kernel_last_error(handle: *mut KernelHandle) -> *mut c_
     }
 }
 
-/// Free a string returned by any FFI function in this module.
-///
-/// # Safety
-/// `ptr` must either be null or a pointer previously returned by this module's
-/// string-returning functions. It must not be freed twice.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_string_free(ptr: *mut c_char) {
     if ptr.is_null() {
@@ -268,13 +508,40 @@ pub unsafe extern "C" fn kernel_string_free(ptr: *mut c_char) {
     let _ = CString::from_raw(ptr);
 }
 
-/// Validate a single event passed as JSON.
 #[no_mangle]
 pub extern "C" fn kernel_validate_event(input_json: *const c_char) -> *mut c_char {
     let input = match from_c_string(input_json) {
         Ok(v) => v,
         Err(e) => return err_json(e),
     };
+
+    if let Ok(request) = parse_submit_request(&input) {
+        let validation = match validate_operation_shape(&request.operation, &request.params) {
+            Ok(_) => {
+                let verifying_key = match verifying_key_from_hex(&request.actor_public_key) {
+                    Ok(v) => v,
+                    Err(e) => return err_json(e),
+                };
+                let bytes = match canonical_submit_request_bytes(&request) {
+                    Ok(v) => v,
+                    Err(e) => return err_json(e),
+                };
+                match verify_event_signature(&verifying_key, &bytes, &request.signature) {
+                    Ok(ok) => json!({
+                        "kind": "submit_request",
+                        "request_id": request.request_id,
+                        "operation": request.operation,
+                        "shape_ok": true,
+                        "signature_ok": ok
+                    }),
+                    Err(e) => return err_json(e),
+                }
+            }
+            Err(e) => return err_json(e),
+        };
+
+        return ok_json(validation);
+    }
 
     let event = match parse_event(&input) {
         Ok(v) => v,
@@ -287,13 +554,128 @@ pub extern "C" fn kernel_validate_event(input_json: *const c_char) -> *mut c_cha
     }
 }
 
-/// Submit a single event into the embedded kernel.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
+fn parse_request_payload<T: for<'de> Deserialize<'de>>(
+    params: &Value,
+    label: &str,
+) -> Result<T, String> {
+    serde_json::from_value::<T>(params.clone()).map_err(|e| format!("{label} parse error: {e}"))
+}
+
+fn execute_submit_request(
+    handle: *mut KernelHandle,
+    request: SubmitEventRequest,
+) -> Result<serde_json::Value, String> {
+    if handle.is_null() {
+        return Err("kernel handle is null".to_string());
+    }
+
+    let handle_ref = unsafe { &*handle };
+    let mut inner = handle_ref
+        .inner
+        .lock()
+        .map_err(|_| "kernel state lock poisoned".to_string())?;
+
+    let _validation = validate_submit_request(&inner, &request)?;
+
+    let result = match operation_name(&request.operation).as_str() {
+        "origin_create" | "create" | "origin" => {
+            let params: OriginCreateRequest =
+                parse_request_payload(&request.params, "origin_create")?;
+            execute_and_collect(&mut inner, "origin_create", |engine| {
+                let state = engine
+                    .origin_create(
+                        params.vector_id,
+                        params.owner_pubkey,
+                        params.space_id,
+                        params.components,
+                        params.seed,
+                        params.nonce,
+                        params.difficulty,
+                    )
+                    .map_err(|e| format!("{e}"))?;
+                Ok(json!({ "state": state }))
+            })?
+        }
+        "transfer" => {
+            let params: TransferRequest = parse_request_payload(&request.params, "transfer")?;
+            execute_and_collect(&mut inner, "transfer", |engine| {
+                let (from_state, to_state) = engine
+                    .transfer(&params.from_id, &params.to_id, params.amount)
+                    .map_err(|e| format!("{e}"))?;
+                Ok(json!({
+                    "from_state": from_state,
+                    "to_state": to_state
+                }))
+            })?
+        }
+        "drain" => {
+            let params: DrainRequest = parse_request_payload(&request.params, "drain")?;
+            execute_and_collect(&mut inner, "drain", |engine| {
+                let state = engine
+                    .drain(&params.vector_id, params.basis_points)
+                    .map_err(|e| format!("{e}"))?;
+                Ok(json!({ "state": state }))
+            })?
+        }
+        "project" => {
+            let params: ProjectRequest = parse_request_payload(&request.params, "project")?;
+            execute_and_collect(&mut inner, "project", |engine| {
+                let state = engine
+                    .project(
+                        &params.vector_id,
+                        params.projected_components,
+                        params.escrow_id,
+                    )
+                    .map_err(|e| format!("{e}"))?;
+                Ok(json!({ "state": state }))
+            })?
+        }
+        "reconstruct" => {
+            let params: ReconstructRequest = parse_request_payload(&request.params, "reconstruct")?;
+            execute_and_collect(&mut inner, "reconstruct", |engine| {
+                let state = engine
+                    .reconstruct(
+                        &params.vector_id,
+                        SettlementOutcome {
+                            outcome_tag: params.outcome_tag,
+                            gains: params.gains,
+                            losses: params.losses,
+                        },
+                    )
+                    .map_err(|e| format!("{e}"))?;
+                Ok(json!({ "state": state }))
+            })?
+        }
+        "certify" => {
+            let params: CertifyRequest = parse_request_payload(&request.params, "certify")?;
+            execute_and_collect(&mut inner, "certify", |engine| {
+                let state = engine
+                    .certify(&params.vector_id)
+                    .map_err(|e| format!("{e}"))?;
+                Ok(json!({ "state": state }))
+            })?
+        }
+        other => return Err(format!("unsupported operation: {other}")),
+    };
+
+    inner.seen_request_ids.insert(request.request_id.clone());
+    clear_last_error(handle);
+
+    Ok(json!({
+        "request_validation": validate_submit_request(&inner, &request)?,
+        "accepted": true,
+        "request_id": request.request_id,
+        "operation": request.operation,
+        "result": result.get("result").cloned().unwrap_or_else(|| json!(null)),
+        "records": result.get("records").cloned().unwrap_or_else(|| json!([])),
+        "replay": result.get("replay").cloned().unwrap_or_else(|| json!(null)),
+        "event_count": result.get("event_count").cloned().unwrap_or_else(|| json!(0)),
+        "latest_clock": result.get("latest_clock").cloned().unwrap_or_else(|| json!(0))
+    }))
+}
+
 #[no_mangle]
-pub unsafe extern "C" fn kernel_submit_event(
+pub extern "C" fn kernel_submit_event(
     handle: *mut KernelHandle,
     input_json: *const c_char,
 ) -> *mut c_char {
@@ -309,7 +691,7 @@ pub unsafe extern "C" fn kernel_submit_event(
         }
     };
 
-    let event = match parse_event(&input) {
+    let request = match parse_submit_request(&input) {
         Ok(v) => v,
         Err(e) => {
             set_last_error(handle, e.clone());
@@ -317,57 +699,15 @@ pub unsafe extern "C" fn kernel_submit_event(
         }
     };
 
-    match validate_event_internal(&event) {
-        Ok(validation) => {
-            let hashes_ok = validation
-                .get("hashes_ok")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let dag_ok = validation
-                .get("dag_ok")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let signature_ok = validation
-                .get("signature_ok")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            if !hashes_ok || !dag_ok || !signature_ok {
-                let msg = format!("event rejected: {validation}");
-                set_last_error(handle, msg.clone());
-                return err_json(msg);
-            }
-        }
+    match execute_submit_request(handle, request) {
+        Ok(result) => ok_json(result),
         Err(e) => {
             set_last_error(handle, e.clone());
-            return err_json(e);
+            err_json(e)
         }
     }
-
-    let handle_ref = &*handle;
-    let mut inner = match handle_ref.inner.lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            let msg = "kernel state lock poisoned".to_string();
-            set_last_error(handle, msg.clone());
-            return err_json(msg);
-        }
-    };
-
-    inner.events.push(event.clone());
-    clear_last_error(handle);
-
-    ok_json(json!({
-        "accepted": true,
-        "record": event
-    }))
 }
 
-/// Execute a batch of events passed as JSON.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_execute_operation(
     handle: *mut KernelHandle,
@@ -385,7 +725,7 @@ pub unsafe extern "C" fn kernel_execute_operation(
         }
     };
 
-    let events = match parse_event_list(&input) {
+    let requests = match parse_submit_request_list(&input) {
         Ok(v) => v,
         Err(e) => {
             set_last_error(handle, e.clone());
@@ -393,30 +733,22 @@ pub unsafe extern "C" fn kernel_execute_operation(
         }
     };
 
-    let ordered = match topological_order(&events) {
-        Ok(v) => v,
-        Err(e) => {
-            set_last_error(handle, e.clone());
-            return err_json(format!("batch ordering error: {e}"));
-        }
-    };
+    let mut results = Vec::with_capacity(requests.len());
 
-    match replay_from_events(&ordered) {
-        Ok(result) => {
-            clear_last_error(handle);
-            to_c_string(result.to_string())
-        }
-        Err(e) => {
-            set_last_error(handle, e.clone());
-            err_json(e)
+    for request in requests {
+        match execute_submit_request(handle, request) {
+            Ok(v) => results.push(v),
+            Err(e) => {
+                set_last_error(handle, e.clone());
+                return err_json(e);
+            }
         }
     }
+
+    clear_last_error(handle);
+    ok_json(json!({ "results": results }))
 }
 
-/// Replay the events currently stored in the embedded kernel handle.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_replay(handle: *mut KernelHandle) -> *mut c_char {
     if handle.is_null() {
@@ -433,7 +765,7 @@ pub unsafe extern "C" fn kernel_replay(handle: *mut KernelHandle) -> *mut c_char
         }
     };
 
-    match replay_from_events(&inner.events) {
+    match engine_replay_summary(&inner) {
         Ok(result) => {
             clear_last_error(handle);
             to_c_string(result.to_string())
@@ -460,10 +792,6 @@ pub unsafe extern "C" fn kernel_replay(handle: *mut KernelHandle) -> *mut c_char
     }
 }
 
-/// Compute a state root from the events currently stored in the kernel handle.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_compute_state_root(handle: *mut KernelHandle) -> *mut c_char {
     if handle.is_null() {
@@ -480,71 +808,40 @@ pub unsafe extern "C" fn kernel_compute_state_root(handle: *mut KernelHandle) ->
         }
     };
 
-    let output = if inner.events.is_empty() {
-        let empty_state: BTreeMap<String, VectorState> = BTreeMap::new();
-        let empty_states: [VectorStateV1; 0] = [];
-        let _canonical_bytes = canonical_state_map_bytes(&empty_state);
-        let state_root = compute_state_root(&empty_states, 0);
-        json!({
-            "ok": true,
-            "state_root": state_root,
-            "event_count": 0u64,
-            "logical_clock": 0u64
-        })
-    } else {
-        match replay_from_events(&inner.events) {
-            Ok(replay_json) => {
-                let state_root = replay_json.get("state_root").cloned().unwrap_or_else(|| {
-                    json!({
-                        "root_hash": "",
-                        "event_count": 0u64,
-                        "logical_clock": 0u64
-                    })
-                });
-
-                let event_count = replay_json
-                    .get("event_count")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-
-                let logical_clock = replay_json
-                    .get("latest_clock")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-
-                json!({
-                    "ok": true,
-                    "state_root": state_root,
-                    "event_count": event_count,
-                    "logical_clock": logical_clock
-                })
-            }
-            Err(e) => {
-                set_last_error(handle, e.clone());
-                json!({
-                    "ok": false,
-                    "error": e,
-                    "state_root": {
-                        "root_hash": "",
-                        "event_count": 0u64,
-                        "logical_clock": 0u64
-                    },
+    let output = match inner.engine.current_state_root() {
+        Ok(state_root) => {
+            let event_count = inner
+                .engine
+                .query_events()
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+            json!({
+                "ok": true,
+                "state_root": state_root,
+                "event_count": event_count,
+                "logical_clock": state_root.logical_clock
+            })
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            set_last_error(handle, msg.clone());
+            json!({
+                "ok": false,
+                "error": msg,
+                "state_root": {
+                    "root_hash": "",
                     "event_count": 0u64,
                     "logical_clock": 0u64
-                })
-            }
+                },
+                "event_count": 0u64,
+                "logical_clock": 0u64
+            })
         }
     };
 
     to_c_string(output.to_string())
 }
 
-/// Verify a record passed as JSON.
-/// Expected input can be a raw VectorEvent or {"record": <VectorEvent>}.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_verify_record(
     handle: *mut KernelHandle,
@@ -623,14 +920,6 @@ pub unsafe extern "C" fn kernel_verify_record(
     }
 }
 
-/// Verify a signature passed as JSON.
-///
-/// Expected input:
-/// {
-///   "public_key": "<hex verifying key>",
-///   "payload": "<raw UTF-8 payload>",
-///   "signature": "<hex signature>"
-/// }
 #[no_mangle]
 pub extern "C" fn kernel_verify_signature(input_json: *const c_char) -> *mut c_char {
     let input = match from_c_string(input_json) {
@@ -667,11 +956,6 @@ pub extern "C" fn kernel_verify_signature(input_json: *const c_char) -> *mut c_c
     }
 }
 
-/// Create an origin vector request.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_origin_create(
     handle: *mut KernelHandle,
@@ -684,11 +968,6 @@ pub unsafe extern "C" fn kernel_origin_create(
     kernel_not_implemented("kernel_origin_create")
 }
 
-/// Transfer request.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_transfer(
     handle: *mut KernelHandle,
@@ -697,15 +976,54 @@ pub unsafe extern "C" fn kernel_transfer(
     if handle.is_null() {
         return err_json("kernel handle is null");
     }
-    let _ = input_json;
-    kernel_not_implemented("kernel_transfer")
+
+    let input = match from_c_string(input_json) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            return err_json(e);
+        }
+    };
+
+    let params: TransferRequest = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("transfer parse error: {e}");
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    let handle_ref = &*handle;
+    let mut inner = match handle_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let msg = "kernel state lock poisoned".to_string();
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    match execute_and_collect(&mut inner, "transfer", |engine| {
+        let (from_state, to_state) = engine
+            .transfer(&params.from_id, &params.to_id, params.amount)
+            .map_err(|e| format!("{e}"))?;
+        Ok(json!({
+            "from_state": from_state,
+            "to_state": to_state
+        }))
+    }) {
+        Ok(result) => {
+            clear_last_error(handle);
+            ok_json(result)
+        }
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            err_json(e)
+        }
+    }
 }
 
-/// Drain request.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_drain(
     handle: *mut KernelHandle,
@@ -714,15 +1032,51 @@ pub unsafe extern "C" fn kernel_drain(
     if handle.is_null() {
         return err_json("kernel handle is null");
     }
-    let _ = input_json;
-    kernel_not_implemented("kernel_drain")
+
+    let input = match from_c_string(input_json) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            return err_json(e);
+        }
+    };
+
+    let params: DrainRequest = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("drain parse error: {e}");
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    let handle_ref = &*handle;
+    let mut inner = match handle_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let msg = "kernel state lock poisoned".to_string();
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    match execute_and_collect(&mut inner, "drain", |engine| {
+        let state = engine
+            .drain(&params.vector_id, params.basis_points)
+            .map_err(|e| format!("{e}"))?;
+        Ok(json!({ "state": state }))
+    }) {
+        Ok(result) => {
+            clear_last_error(handle);
+            ok_json(result)
+        }
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            err_json(e)
+        }
+    }
 }
 
-/// Project request.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_project(
     handle: *mut KernelHandle,
@@ -731,15 +1085,55 @@ pub unsafe extern "C" fn kernel_project(
     if handle.is_null() {
         return err_json("kernel handle is null");
     }
-    let _ = input_json;
-    kernel_not_implemented("kernel_project")
+
+    let input = match from_c_string(input_json) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            return err_json(e);
+        }
+    };
+
+    let params: ProjectRequest = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("project parse error: {e}");
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    let handle_ref = &*handle;
+    let mut inner = match handle_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let msg = "kernel state lock poisoned".to_string();
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    match execute_and_collect(&mut inner, "project", |engine| {
+        let state = engine
+            .project(
+                &params.vector_id,
+                params.projected_components,
+                params.escrow_id,
+            )
+            .map_err(|e| format!("{e}"))?;
+        Ok(json!({ "state": state }))
+    }) {
+        Ok(result) => {
+            clear_last_error(handle);
+            ok_json(result)
+        }
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            err_json(e)
+        }
+    }
 }
 
-/// Reconstruct request.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_reconstruct(
     handle: *mut KernelHandle,
@@ -748,15 +1142,58 @@ pub unsafe extern "C" fn kernel_reconstruct(
     if handle.is_null() {
         return err_json("kernel handle is null");
     }
-    let _ = input_json;
-    kernel_not_implemented("kernel_reconstruct")
+
+    let input = match from_c_string(input_json) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            return err_json(e);
+        }
+    };
+
+    let params: ReconstructRequest = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("reconstruct parse error: {e}");
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    let handle_ref = &*handle;
+    let mut inner = match handle_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let msg = "kernel state lock poisoned".to_string();
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    match execute_and_collect(&mut inner, "reconstruct", |engine| {
+        let state = engine
+            .reconstruct(
+                &params.vector_id,
+                SettlementOutcome {
+                    outcome_tag: params.outcome_tag,
+                    gains: params.gains,
+                    losses: params.losses,
+                },
+            )
+            .map_err(|e| format!("{e}"))?;
+        Ok(json!({ "state": state }))
+    }) {
+        Ok(result) => {
+            clear_last_error(handle);
+            ok_json(result)
+        }
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            err_json(e)
+        }
+    }
 }
 
-/// Certify request.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_certify(
     handle: *mut KernelHandle,
@@ -765,24 +1202,56 @@ pub unsafe extern "C" fn kernel_certify(
     if handle.is_null() {
         return err_json("kernel handle is null");
     }
-    let _ = input_json;
-    kernel_not_implemented("kernel_certify")
+
+    let input = match from_c_string(input_json) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            return err_json(e);
+        }
+    };
+
+    let params: CertifyRequest = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("certify parse error: {e}");
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    let handle_ref = &*handle;
+    let mut inner = match handle_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let msg = "kernel state lock poisoned".to_string();
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    match execute_and_collect(&mut inner, "certify", |engine| {
+        let state = engine
+            .certify(&params.vector_id)
+            .map_err(|e| format!("{e}"))?;
+        Ok(json!({ "state": state }))
+    }) {
+        Ok(result) => {
+            clear_last_error(handle);
+            ok_json(result)
+        }
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            err_json(e)
+        }
+    }
 }
 
-/// Return the current state root.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_current_state_root(handle: *mut KernelHandle) -> *mut c_char {
     kernel_compute_state_root(handle)
 }
 
-/// Query a single vector.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_query_vector(
     handle: *mut KernelHandle,
@@ -791,15 +1260,51 @@ pub unsafe extern "C" fn kernel_query_vector(
     if handle.is_null() {
         return err_json("kernel handle is null");
     }
-    let _ = input_json;
-    kernel_not_implemented("kernel_query_vector")
+
+    let input = match from_c_string(input_json) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            return err_json(e);
+        }
+    };
+
+    let request: QueryVectorRequest = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("query_vector parse error: {e}");
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    let handle_ref = &*handle;
+    let inner = match handle_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let msg = "kernel state lock poisoned".to_string();
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    match inner.engine.query_vector(&request.vector_id) {
+        Ok(Some(vector)) => {
+            clear_last_error(handle);
+            ok_json(json!({ "vector": vector }))
+        }
+        Ok(None) => {
+            clear_last_error(handle);
+            ok_json(json!({ "found": false }))
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            set_last_error(handle, msg.clone());
+            err_json(msg)
+        }
+    }
 }
 
-/// Query multiple vectors.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_query_vectors(
     handle: *mut KernelHandle,
@@ -808,15 +1313,31 @@ pub unsafe extern "C" fn kernel_query_vectors(
     if handle.is_null() {
         return err_json("kernel handle is null");
     }
+
     let _ = input_json;
-    kernel_not_implemented("kernel_query_vectors")
+    let handle_ref = &*handle;
+    let inner = match handle_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let msg = "kernel state lock poisoned".to_string();
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    match inner.engine.query_vectors() {
+        Ok(vectors) => {
+            clear_last_error(handle);
+            ok_json(json!({ "vectors": vectors }))
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            set_last_error(handle, msg.clone());
+            err_json(msg)
+        }
+    }
 }
 
-/// Query records.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_query_records(
     handle: *mut KernelHandle,
@@ -825,15 +1346,31 @@ pub unsafe extern "C" fn kernel_query_records(
     if handle.is_null() {
         return err_json("kernel handle is null");
     }
+
     let _ = input_json;
-    kernel_not_implemented("kernel_query_records")
+    let handle_ref = &*handle;
+    let inner = match handle_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let msg = "kernel state lock poisoned".to_string();
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    match inner.engine.query_records() {
+        Ok(records) => {
+            clear_last_error(handle);
+            ok_json(json!({ "records": records }))
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            set_last_error(handle, msg.clone());
+            err_json(msg)
+        }
+    }
 }
 
-/// Query an event by hash.
-///
-/// # Safety
-/// `handle` must be a valid pointer returned by `kernel_init` or null.
-/// `input_json` must point to a valid null-terminated UTF-8 string.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_query_event_by_hash(
     handle: *mut KernelHandle,
@@ -842,6 +1379,47 @@ pub unsafe extern "C" fn kernel_query_event_by_hash(
     if handle.is_null() {
         return err_json("kernel handle is null");
     }
-    let _ = input_json;
-    kernel_not_implemented("kernel_query_event_by_hash")
+
+    let input = match from_c_string(input_json) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(handle, e.clone());
+            return err_json(e);
+        }
+    };
+
+    let request: QueryEventByHashRequest = match serde_json::from_str(&input) {
+        Ok(v) => v,
+        Err(e) => {
+            let msg = format!("query_event_by_hash parse error: {e}");
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    let handle_ref = &*handle;
+    let inner = match handle_ref.inner.lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            let msg = "kernel state lock poisoned".to_string();
+            set_last_error(handle, msg.clone());
+            return err_json(msg);
+        }
+    };
+
+    match inner.engine.query_event_by_hash(&request.event_hash) {
+        Ok(Some(event)) => {
+            clear_last_error(handle);
+            ok_json(json!({ "event": event }))
+        }
+        Ok(None) => {
+            clear_last_error(handle);
+            ok_json(json!({ "found": false }))
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            set_last_error(handle, msg.clone());
+            err_json(msg)
+        }
+    }
 }

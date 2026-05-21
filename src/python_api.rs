@@ -1,9 +1,11 @@
 use crate::engine::KernelEngine;
 use crate::reconstruction::SettlementOutcome;
+use crate::region::{RegionCreateRequest, RegionVisibility};
 use crate::storage::MemoryStore;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 fn to_json<T: Serialize>(value: &T) -> PyResult<String> {
     serde_json::to_string(value).map_err(|err| PyValueError::new_err(err.to_string()))
@@ -11,6 +13,16 @@ fn to_json<T: Serialize>(value: &T) -> PyResult<String> {
 
 fn map_err<E: ToString>(err: E) -> PyErr {
     PyValueError::new_err(err.to_string())
+}
+
+fn parse_region_visibility(value: &str) -> PyResult<RegionVisibility> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "public" => Ok(RegionVisibility::Public),
+        "private" => Ok(RegionVisibility::Private),
+        other => Err(PyValueError::new_err(format!(
+            "invalid region visibility: {other}"
+        ))),
+    }
 }
 
 #[pyclass(unsendable)]
@@ -120,6 +132,97 @@ impl PyKernelEngine {
             .map_err(map_err)?;
 
         to_json(&state)
+    }
+
+    pub fn create_region(
+        &mut self,
+        region_name: String,
+        actor_public_key: String,
+        trigger_event_hash: String,
+        creation_proof: String,
+        visibility: String,
+        request_signature: String,
+        region_prefix: Option<String>,
+        suggested_title: Option<String>,
+        access_key: Option<String>,
+        metadata: Option<BTreeMap<String, String>>,
+    ) -> PyResult<String> {
+        let request = RegionCreateRequest {
+            region_name,
+            region_prefix,
+            suggested_title,
+            visibility: parse_region_visibility(&visibility)?,
+            trigger_event_hash,
+            creation_proof,
+            access_key,
+            metadata: metadata.unwrap_or_default(),
+            request_signature,
+        };
+
+        let state = self
+            .inner
+            .create_region(request, actor_public_key)
+            .map_err(map_err)?;
+
+        to_json(&state)
+    }
+
+    pub fn query_region(&self, region_id: String) -> PyResult<String> {
+        let result = self.inner.query_region(&region_id).map_err(map_err)?;
+        to_json(&result)
+    }
+
+    pub fn query_region_by_name(
+        &self,
+        region_name: String,
+        region_prefix: Option<String>,
+    ) -> PyResult<String> {
+        let result = self
+            .inner
+            .query_region_by_name(&region_name, region_prefix.as_deref())
+            .map_err(map_err)?;
+        to_json(&result)
+    }
+
+    pub fn query_regions(&self) -> PyResult<String> {
+        let result = self.inner.query_regions().map_err(map_err)?;
+        to_json(&result)
+    }
+
+    pub fn resolve_region_id(
+        &self,
+        region_name: String,
+        region_prefix: Option<String>,
+    ) -> PyResult<String> {
+        let result = self
+            .inner
+            .resolve_region_id(&region_name, region_prefix.as_deref())
+            .map_err(map_err)?;
+        to_json(&result)
+    }
+
+    pub fn region_exists(
+        &self,
+        region_name: String,
+        region_prefix: Option<String>,
+    ) -> PyResult<String> {
+        let result = self
+            .inner
+            .region_exists(&region_name, region_prefix.as_deref())
+            .map_err(map_err)?;
+        to_json(&result)
+    }
+
+    pub fn authorize_region(
+        &self,
+        region_id: String,
+        access_key: Option<String>,
+    ) -> PyResult<String> {
+        let result = self
+            .inner
+            .authorize_region(&region_id, access_key.as_deref())
+            .map_err(map_err)?;
+        to_json(&result)
     }
 
     pub fn query_vector(&self, vector_id: String) -> PyResult<String> {

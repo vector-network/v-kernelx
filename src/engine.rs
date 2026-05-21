@@ -10,6 +10,11 @@ use crate::query::{get_event_by_hash, get_vector, list_records, list_vectors};
 use crate::reconstruction::reconstruct_vector;
 use crate::reconstruction::SettlementOutcome;
 use crate::record::{make_record_id, OperationKind, VectorRecordV1};
+use crate::region::{
+    authorize_region_access, build_region_genesis_event, find_region_by_lookup_key,
+    list_regions_from_events, region_state_from_event, validate_region_create_request,
+    verify_region_create_request_signature, RegionCreateRequest, RegionState,
+};
 use crate::replay::{replay_events, ReplayResult};
 use crate::state::{compute_state_root, now_ms, StateRoot, VectorStateV1};
 use crate::storage::{EventStore, KernelStore, MemoryStore, ReplayStore, StateStore};
@@ -127,6 +132,14 @@ impl<S: KernelStore> KernelEngine<S> {
             .map_err(|_| KernelXError::InvalidState("event sequence overflow".to_string()))
     }
 
+    fn next_logical_clock(&self) -> Result<u64, KernelXError> {
+        let events = self.query_events()?;
+        Ok(events
+            .last()
+            .map(|event| event.logical_clock.saturating_add(1))
+            .unwrap_or(0))
+    }
+
     fn build_transition_event(
         &self,
         before: Option<&VectorStateV1>,
@@ -197,6 +210,117 @@ impl<S: KernelStore> KernelEngine<S> {
         Ok(())
     }
 
+    pub fn query_events(&self) -> Result<Vec<VectorEvent>, KernelXError> {
+        let mut events = <S as ReplayStore>::load_events_for_replay(&self.store)?;
+        events.sort_by(|a, b| {
+            a.logical_clock
+                .cmp(&b.logical_clock)
+                .then_with(|| a.timestamp.cmp(&b.timestamp))
+                .then_with(|| a.event_hash.cmp(&b.event_hash))
+                .then_with(|| a.event_id.cmp(&b.event_id))
+        });
+        Ok(events)
+    }
+
+    pub fn latest_event(&self) -> Result<Option<VectorEvent>, KernelXError> {
+        let mut events = self.query_events()?;
+        Ok(events.pop())
+    }
+
+    pub fn query_regions(&self) -> Result<Vec<RegionState>, KernelXError> {
+        let events = self.query_events()?;
+        list_regions_from_events(&events)
+    }
+
+    pub fn query_region(&self, region_id: &str) -> Result<Option<RegionState>, KernelXError> {
+        let regions = self.query_regions()?;
+        Ok(regions
+            .into_iter()
+            .find(|region| region.region_id == region_id))
+    }
+
+    pub fn query_region_by_name(
+        &self,
+        region_name: &str,
+        region_prefix: Option<&str>,
+    ) -> Result<Option<RegionState>, KernelXError> {
+        let events = self.query_events()?;
+        find_region_by_lookup_key(&events, region_name, region_prefix)
+    }
+
+    pub fn resolve_region_id(
+        &self,
+        region_name: &str,
+        region_prefix: Option<&str>,
+    ) -> Result<Option<String>, KernelXError> {
+        Ok(self
+            .query_region_by_name(region_name, region_prefix)?
+            .map(|region| region.region_id))
+    }
+
+    pub fn region_exists(
+        &self,
+        region_name: &str,
+        region_prefix: Option<&str>,
+    ) -> Result<bool, KernelXError> {
+        Ok(self
+            .query_region_by_name(region_name, region_prefix)?
+            .is_some())
+    }
+
+    pub fn authorize_region(
+        &self,
+        region_id: &str,
+        access_key: Option<&str>,
+    ) -> Result<bool, KernelXError> {
+        match self.query_region(region_id)? {
+            Some(region) => Ok(authorize_region_access(&region, access_key)),
+            None => Err(KernelXError::InvalidState("region not found".to_string())),
+        }
+    }
+
+    pub fn create_region(
+        &mut self,
+        request: RegionCreateRequest,
+        actor_public_key: impl Into<String>,
+    ) -> Result<RegionState, KernelXError> {
+        let actor_public_key = actor_public_key.into();
+        validate_region_create_request(&request)?;
+        verify_region_create_request_signature(&actor_public_key, &request)?;
+
+        if self
+            .query_region_by_name(&request.region_name, request.region_prefix.as_deref())?
+            .is_some()
+        {
+            return Err(KernelXError::InvalidState(
+                "region already exists for this lookup key".to_string(),
+            ));
+        }
+
+        if actor_public_key.trim().is_empty() {
+            return Err(KernelXError::InvalidState(
+                "actor_public_key cannot be empty".to_string(),
+            ));
+        }
+
+        let logical_clock = self.next_logical_clock()?;
+        let timestamp = now_ms();
+        let sequence = 1_u64;
+
+        let event = build_region_genesis_event(
+            &request,
+            &actor_public_key,
+            logical_clock,
+            timestamp,
+            sequence,
+        )?;
+
+        validate_event(&event)?;
+        self.append_canonical_event(event.clone())?;
+
+        region_state_from_event(&event)
+    }
+
     pub fn replay_canonical_history(&self) -> Result<ReplayResult, KernelXError> {
         let events = <S as ReplayStore>::load_events_for_replay(&self.store)?;
         replay_events(&events).map_err(KernelXError::InvalidState)
@@ -212,12 +336,14 @@ impl<S: KernelStore> KernelEngine<S> {
     pub fn metrics(&self) -> Result<serde_json::Value, KernelXError> {
         let vectors = self.query_vectors()?;
         let records = self.query_records()?;
+        let regions = self.query_regions().ok();
         let replay = self.replay_canonical_history().ok();
         let state_root = self.current_state_root().ok();
 
         Ok(serde_json::json!({
             "vector_count": vectors.len(),
             "record_count": records.len(),
+            "region_count": regions.as_ref().map(|v| v.len()).unwrap_or(0),
             "event_count": replay
                 .as_ref()
                 .map(|r| r.applied_event_hashes.len())
