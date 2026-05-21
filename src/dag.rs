@@ -7,7 +7,6 @@ pub struct DagConflict {
     pub reason: String,
 }
 
-
 fn event_index(events: &[VectorEvent]) -> Result<BTreeMap<String, usize>, String> {
     let mut index = BTreeMap::new();
 
@@ -238,4 +237,3 @@ pub fn topological_order(events: &[VectorEvent]) -> Result<Vec<VectorEvent>, Str
 
     Ok(ordered)
 }
-
